@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>LocalPilot</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="drag-region"></div>
+      <div class="brand">LocalPilot</div>
+      <button id="newChatBtn" class="btn primary wide">+ New chat</button>
+      <div class="side-tools">
+        <button id="compareBtn" class="btn ghost small" title="Run one prompt on two models side by side">Compare models</button>
+        <button id="promptsBtn" class="btn ghost small" title="Saved prompts you can use with /name">Saved prompts</button>
+      </div>
+      <div class="section-label">Chats</div>
+      <ul id="chatList" class="chat-list"></ul>
+      <div class="sidebar-footer">
+        <div class="section-label">Workspace</div>
+        <button id="workspaceBtn" class="workspace" title="Change workspace folder">
+          <span id="workspacePath">~/projects</span>
+        </button>
+        <div id="projectLine" class="muted small project-line"></div>
+        <button id="revealWorkspaceBtn" class="btn ghost small wide">Open in Finder</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="drag-region"></div>
+        <div class="topbar-row">
+          <div class="control">
+            <label for="modelSelect">Model</label>
+            <div class="model-row">
+              <select id="modelSelect"></select>
+              <span id="modelStatus" class="pill">checking…</span>
+              <button id="manageModelsBtn" class="btn ghost small">Manage</button>
+            </div>
+          </div>
+
+          <div class="control">
+            <label>Effort</label>
+            <div class="segmented" id="effortSeg">
+              <button data-value="low" title="No thinking, short answers, up to 8 steps">Low</button>
+              <button data-value="medium" title="Thinks before answering, up to 16 steps">Medium</button>
+              <button data-value="high" title="Thinks, up to 30 steps, verifies its work">High</button>
+            </div>
+          </div>
+
+          <div class="control">
+            <label>Mode</label>
+            <div class="segmented" id="modeSeg">
+              <button data-value="chat" title="Chat only — no tools">Chat</button>
+              <button data-value="manual" title="Asks before every file change and command">Manual</button>
+              <button data-value="auto" title="Edits files automatically, asks before running commands">Auto</button>
+            </div>
+          </div>
+
+          <div class="control">
+            <label>Extras</label>
+            <div class="toggles">
+              <button id="webToggle" class="toggle" title="Let the model search the web and read pages. Searches leave your Mac.">Web</button>
+              <button id="checkToggle" class="toggle" title="Automatically syntax-check / load files after the model writes them">Self-check</button>
+            </div>
+          </div>
+
+          <div class="stats">
+            <div class="meter" title="How full the model's context window is. Auto-compacts at 80%.">
+              <div class="meter-label"><span>Context</span><span id="ctxText">0 / 0</span></div>
+              <div class="meter-bar"><div id="ctxBar"></div></div>
+            </div>
+            <div class="burn" title="Tokens processed in this chat">
+              <div><span class="k">In</span> <span id="tokIn">0</span></div>
+              <div><span class="k">Out</span> <span id="tokOut">0</span></div>
+              <div><span class="k">Think</span> <span id="tokThink">0</span></div>
+              <div><span class="k">Cached</span> <span id="tokCached">0</span></div>
+              <div><span class="k">Speed</span> <span id="tokSpeed">–</span></div>
+            </div>
+            <button id="compactBtn" class="btn ghost small" title="Summarize the conversation to free up context">Compact</button>
+          </div>
+        </div>
+      </header>
+
+      <section id="messages" class="messages"></section>
+
+      <footer class="composer">
+        <div id="banner" class="banner hidden"></div>
+        <div id="slashMenu" class="slash-menu hidden" role="listbox"></div>
+        <div id="attachTray" class="attach-tray hidden"></div>
+        <div class="composer-box">
+          <button id="attachBtn" class="btn ghost icon" title="Attach images (or paste / drop them)">＋</button>
+          <input id="fileInput" type="file" accept="image/*" multiple class="hidden">
+          <textarea id="input" rows="1" placeholder="Ask it to build or explain something…  Type / for saved prompts. Enter to send, Shift+Enter for a new line."></textarea>
+          <button id="sendBtn" class="btn primary">Send</button>
+          <button id="stopBtn" class="btn danger hidden">Stop</button>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <div id="modelModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modelModalTitle">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2 id="modelModalTitle">Models</h2>
+        <button class="btn ghost small close-modal" aria-label="Close">✕</button>
+      </div>
+
+      <div class="modal-section">
+        <div class="row space">
+          <h3>On this Mac</h3>
+          <div class="row">
+            <label for="ctxSelect" class="muted">Context to load with</label>
+            <select id="ctxSelect">
+              <option value="4096">4,096</option>
+              <option value="8192">8,192</option>
+              <option value="16384">16,384</option>
+              <option value="24576">24,576</option>
+              <option value="32768">32,768</option>
+            </select>
+          </div>
+        </div>
+        <table class="model-table">
+          <thead><tr><th>Model</th><th>Size</th><th>Status</th><th></th></tr></thead>
+          <tbody id="modelRows"></tbody>
+        </table>
+        <p class="muted small">Memory estimates come from LM Studio. Your GPU can use about 10.7 GB; quit Chrome to fit more context.
+          Models on the LocalPilot engine use a compressed cache (except Qwen3.5/3.6), so they fit roughly twice the context.</p>
+      </div>
+
+      <div class="modal-section">
+        <h3>Pick the model automatically</h3>
+        <div class="row wrap">
+          <label class="check"><input id="routeEnabled" type="checkbox"> At the start of each chat, switch to</label>
+          <select id="routeCode"></select>
+          <span class="muted">for coding and</span>
+          <select id="routeGeneral"></select>
+          <span class="muted">for questions and explanations.</span>
+        </div>
+      </div>
+
+      <div class="modal-section">
+        <h3>Download a model</h3>
+        <div class="row">
+          <input id="downloadInput" type="text" placeholder="e.g. HauhauCS/Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced  or a Hugging Face URL">
+          <button id="downloadBtn" class="btn primary">Download</button>
+        </div>
+        <pre id="downloadLog" class="log hidden"></pre>
+      </div>
+    </div>
+  </div>
+
+  <div id="promptsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="promptsTitle">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2 id="promptsTitle">Saved prompts</h2>
+        <button class="btn ghost small close-modal" aria-label="Close">✕</button>
+      </div>
+      <p class="muted small">Type <code>/name</code> in the message box. <code>{input}</code> is replaced by whatever you type after the name.</p>
+      <table class="model-table">
+        <thead><tr><th>Name</th><th>Prompt</th><th></th></tr></thead>
+        <tbody id="promptRows"></tbody>
+      </table>
+      <div class="modal-section">
+        <h3>Add a prompt</h3>
+        <div class="row">
+          <input id="newPromptName" type="text" placeholder="name, e.g. pentest" class="name-input">
+          <input id="newPromptText" type="text" placeholder="Prompt text. Use {input} for what you type after /name">
+          <button id="addPromptBtn" class="btn primary">Add</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="compareModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="compareTitle">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <h2 id="compareTitle">Compare models</h2>
+        <button class="btn ghost small close-modal" aria-label="Close">✕</button>
+      </div>
+      <p class="muted small">Runs the prompt on each model one after the other (only one fits in memory at a time), with tools off. Your current model is reloaded afterwards.</p>
+      <div class="row">
+        <select id="compareA"></select>
+        <span class="muted">vs</span>
+        <select id="compareB"></select>
+      </div>
+      <textarea id="comparePrompt" rows="3" placeholder="e.g. Write a Python function that parses an nginx access log line."></textarea>
+      <div class="row">
+        <button id="compareRun" class="btn primary">Run comparison</button>
+        <span id="compareStatus" class="muted small"></span>
+      </div>
+      <div class="compare-grid">
+        <div class="compare-col"><div id="compareHeadA" class="compare-head"></div><div id="compareOutA" class="content"></div></div>
+        <div class="compare-col"><div id="compareHeadB" class="compare-head"></div><div id="compareOutB" class="content"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="../node_modules/marked/lib/marked.umd.js"></script>
+  <script src="../node_modules/dompurify/dist/purify.min.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

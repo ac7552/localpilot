@@ -1,0 +1,49 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index e9064666f..56d18223f 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -377,7 +377,43 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+ 
+-        GGML_ASSERT(buf_dst);
++        if (buf_dst == nil) {
++            // newBufferWithBytesNoCopy requires page-aligned host memory, and older macOS
++            // (e.g. 13 Ventura) returns nil otherwise. Fall back to a synchronous copy
++            // through a temporary shared buffer.
++            if (size == 0) {
++                return;
++            }
++
++            struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
++            if (bid_src.metal == nil) {
++                GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
++            }
++            bid_src.offs += offset;
++
++            ggml_metal_synchronize(ctx);
++
++            id<MTLBuffer> buf_tmp = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
++            GGML_ASSERT(buf_tmp);
++
++            id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
++            id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
++            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
++
++            [encoder copyFromBuffer:bid_src.metal
++                       sourceOffset:bid_src.offs
++                           toBuffer:buf_tmp
++                  destinationOffset:0
++                               size:size];
++
++            [encoder endEncoding];
++            [cmd_buf commit];
++            [cmd_buf waitUntilCompleted];
++
++            memcpy(data, [buf_tmp contents], size);
++            [buf_tmp release];
++            return;
++        }
+ 
+         struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
+         if (bid_src.metal == nil) {

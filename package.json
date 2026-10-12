@@ -1,0 +1,20 @@
+{
+  "name": "localpilot",
+  "productName": "LocalPilot",
+  "version": "0.1.0",
+  "description": "Desktop chat + coding agent for local models served by LM Studio",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "package": "electron-packager . LocalPilot --platform=darwin --arch=arm64 --out=dist --overwrite --icon=build/icon.icns --ignore=^/dist"
+  },
+  "devDependencies": {
+    "@electron/packager": "^18.4.4",
+    "electron": "^37.10.3"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.17",
+    "marked": "^15.0.12"
+  }
+}
