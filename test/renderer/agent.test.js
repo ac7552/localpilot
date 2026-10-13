@@ -1,0 +1,199 @@
+// The agent loop end to end: a scripted model, the real UI, real files in a temporary workspace.
+const fs = require('fs');
+const path = require('path');
+const assert = require('assert');
+const { loadApp, sleep } = require('../harness/app');
+const { fakeModel } = require('../harness/fake-model');
+const { test, run } = require('../harness/run');
+
+const call = (name, args) => ({ name, args });
+const toolResults = (body) => body.messages.filter((x) => x.role === 'tool').map((x) => x.content);
+
+// One fresh app per test; the fake model answers in order.
+async function withApp(opts, replies, fn) {
+  const app = await loadApp(opts);
+  const model = fakeModel(replies);
+  try {
+    await fn(app, model);
+    assert.deepEqual(app.errors, [], 'no errors in the page');
+  } finally {
+    model.restore();
+    await app.close();
+  }
+}
+
+test('Auto mode: writes a file, asks before running a command, then answers', () => withApp({}, [
+  { reasoning: 'Write the script first.', tools: [call('write_file', { path: 'hello/hello.py', content: 'print("hi from hello")\n' })] },
+  { tools: [call('run_command', { command: 'python3 hello/hello.py' })] },
+  { content: 'Done! Run it with `python3 hello/hello.py`.' },
+], async (app, model) => {
+  const sending = app.start('Make a hello script and run it');
+  await app.click('Run');
+  assert.equal(model.requests.length, 2, 'the command waits for approval');
+  assert.match(app.$('banner').textContent, /Waiting for your approval/);
+  await sending;
+
+  assert.equal(fs.readFileSync(path.join(app.workspace, 'hello/hello.py'), 'utf8'), 'print("hi from hello")\n');
+  assert.match(toolResults(model.requests[1])[0], /Wrote 23 bytes to hello\/hello.py\nAutomatic check: Syntax check passed\./);
+  assert.match(toolResults(model.requests[2])[1], /^exit code: 0\nhi from hello/);
+  assert.equal(app.text(app.lastAnswer().querySelector('.content')), 'Done! Run it with python3 hello/hello.py.');
+  assert(app.buttons('Save as skill').length, 'the answer can be saved as a skill');
+  assert.equal(app.ev('state.chat.project'), 'hello', 'the project is picked up from the path');
+
+  const saved = JSON.parse(fs.readFileSync(path.join(app.m.dataDir, 'chats', `${app.ev('state.chat.id')}.json`), 'utf8'));
+  assert.equal(saved.messages.filter((x) => x.role === 'assistant').at(-1).content, 'Done! Run it with `python3 hello/hello.py`.');
+
+  await app.click('Undo');
+  await app.waitFor(() => !fs.existsSync(path.join(app.workspace, 'hello/hello.py')), 'undo to remove the file');
+}));
+
+test('a denied command doesn\'t run, and the model hears why', () => withApp({}, [
+  { tools: [call('run_command', { command: 'touch ran.txt' })] },
+  { content: 'Understood, I won\'t run it.' },
+], async (app, model) => {
+  const sending = app.start('Touch a file');
+  await app.waitFor(() => app.buttons('Deny')[0], 'the approval card');
+  app.window.document.querySelector('.tool-actions input').value = 'use Python instead';
+  await app.click('Deny');
+  await sending;
+  assert(!fs.existsSync(path.join(app.workspace, 'ran.txt')));
+  assert.match(toolResults(model.requests[1])[0], /The user denied this run_command\. Reason: use Python instead/);
+}));
+
+test('Manual mode asks before writing a file and shows what it will write', () => withApp({ settings: { mode: 'manual' } }, [
+  { tools: [call('write_file', { path: 'notes.txt', content: 'line one\nline two' })] },
+  { content: 'OK, left it alone.' },
+], async (app, model) => {
+  const sending = app.start('Write some notes');
+  await app.waitFor(() => app.buttons('Approve')[0], 'the approval card');
+  assert.match(app.text(app.window.document.querySelector('.tool.pending')), /New file \(2 lines\) line one line two/);
+  await app.click('Deny');
+  await sending;
+  assert(!fs.existsSync(path.join(app.workspace, 'notes.txt')));
+  assert.match(toolResults(model.requests[1])[0], /The user denied this write_file/);
+}));
+
+test('Chat mode sends no tools', () => withApp({ settings: { mode: 'chat' } }, [
+  { content: 'A TCP handshake is SYN, SYN-ACK, ACK.' },
+], async (app, model) => {
+  await app.send('How does a TCP handshake work?');
+  assert.equal(model.requests[0].tools, undefined);
+  assert.equal(app.text(app.lastAnswer().querySelector('.content')), 'A TCP handshake is SYN, SYN-ACK, ACK.');
+}));
+
+test('paths outside the workspace come back to the model as errors', () => withApp({}, [
+  { tools: [call('write_file', { path: '../escape.txt', content: 'x' }), call('read_file', { path: '/etc/hosts' })] },
+  { content: 'I can only work inside the workspace.' },
+], async (app, model) => {
+  await app.send('Write outside');
+  const [w, r] = toolResults(model.requests[1]);
+  assert.match(w, /^Error: Path "\.\.\/escape\.txt" is outside the workspace/);
+  assert.match(r, /^Error: Path "\/etc\/hosts" is outside the workspace/);
+  assert(!fs.existsSync(path.join(path.dirname(app.workspace), 'escape.txt')));
+}));
+
+test('bad tool arguments and unknown tools are reported, not run', () => withApp({}, [
+  { raw: [
+    `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'a', function: { name: 'write_file', arguments: '{"path": "x.txt", ' } }] } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 1, id: 'b', function: { name: 'delete_everything', arguments: '{}' } }] }, finish_reason: 'tool_calls' }] })}\n\n`,
+    'data: [DONE]\n\n'].join('') },
+  { content: 'Sorry about that.' },
+], async (app, model) => {
+  await app.send('Do something');
+  const [bad, unknown] = toolResults(model.requests[1]);
+  assert.match(bad, /not valid JSON/);
+  assert.match(unknown, /tool "delete_everything" is not available/);
+}));
+
+test('Auto effort starts without thinking and turns it on after a failed self-check', () => withApp({ settings: { effort: 'auto' } }, [
+  { tools: [call('write_file', { path: 'calc/calc.py', content: 'def add(a, b:\n    return a + b\n' })] },
+  { tools: [call('write_file', { path: 'calc/calc.py', content: 'def add(a, b):\n    return a + b\n' })] },
+  { content: 'Fixed and checked.' },
+], async (app, model) => {
+  await app.send('Write an add function');
+  assert.equal(model.requests[0].reasoning_effort, 'none');
+  assert.match(toolResults(model.requests[1])[0], /Syntax check failed/);
+  assert.equal(model.requests[1].reasoning_effort, undefined, 'thinking is on for the next step');
+  assert(app.notices().some((n) => /Thinking turned on .*a self-check failed/.test(n)), app.notices().join('\n'));
+}));
+
+test('the model can ask a question and gets the answer', () => withApp({}, [
+  { tools: [call('ask_user', { question: 'Which language?', options: ['Python', 'Go'] })] },
+  { content: 'Python it is.' },
+], async (app, model) => {
+  const sending = app.start('Write a script');
+  await app.click('Go');
+  await sending;
+  assert.equal(toolResults(model.requests[1])[0], 'The user answered: Go');
+}));
+
+test('an answer left inside unclosed thinking is shown as the answer', () => withApp({}, [
+  { tools: [call('write_file', { path: 'a.txt', content: 'a' })] },
+  { reasoning: 'Done! I created a.txt for you.' },
+], async (app) => {
+  await app.send('Make a.txt');
+  const answer = app.lastAnswer();
+  assert.equal(app.text(answer.querySelector('.content')), 'Done! I created a.txt for you.');
+  assert(answer.querySelector('.thinking').classList.contains('hidden'));
+  assert(app.buttons('Save as skill').length);
+  assert.deepEqual(await app.m.invoke('journal:pending', {}), [app.ev('state.chat.id')], 'the chat can be summarized');
+}));
+
+test('running out of output while thinking says so, and keeps the thought as thinking', () => withApp({}, [
+  { reasoning: 'Let me think about this very carefully…', finish: 'length' },
+], async (app) => {
+  await app.send('Something hard');
+  assert(app.notices().some((n) => /used its whole .*-token output budget thinking/.test(n)), app.notices().join('\n'));
+  assert.equal(app.text(app.lastAnswer().querySelector('.content')), '');
+}));
+
+test('usage that arrives after the stream ends is still counted', () => withApp({ chunkDelayMs: 40 }, [
+  { content: 'All of this answer arrives.', usage: { prompt_tokens: 321, completion_tokens: 42 } },
+], async (app) => {
+  await app.send('Hi');
+  assert.equal(app.text(app.lastAnswer().querySelector('.content')), 'All of this answer arrives.');
+  assert.equal(app.ev('state.chat.usage.completion'), 42);
+  assert.match(app.lastAnswer().querySelector('.meta').textContent, /^321 in · 42 out/);
+}));
+
+test('saved prompts expand before sending', () => withApp({}, [
+  { content: 'Tests written.' },
+], async (app, model) => {
+  await app.send('/test the CSV parser');
+  assert.equal(model.requests[0].messages.at(-1).content, 'Write tests for the CSV parser. Use the project\'s existing test setup if it has one, then run them and fix failures.');
+}));
+
+test('Stop ends a run part way through', () => withApp({}, [
+  { content: 'one two three four five six seven eight nine ten eleven twelve', chunkBytes: 3, delayMs: 20 },
+], async (app) => {
+  const sending = app.start('Count slowly');
+  await app.waitFor(() => app.text(app.lastAnswer()?.querySelector('.content')).length > 0, 'the answer to start');
+  await app.click('Stop');
+  await sending;
+  assert.match(app.lastAnswer().querySelector('.meta').textContent, /stopped/);
+  assert(!app.text(app.lastAnswer().querySelector('.content')).includes('twelve'));
+}));
+
+test('the estimate names what makes the whole chat be read again', () => withApp({}, [
+  { content: 'Hello.' },
+], async (app) => {
+  await app.send('Hi');
+  const note = async (text) => {
+    app.$('input').value = text;
+    app.ev('promptHelp.memory.at = 0');
+    await app.ev('renderPromptHelp()');
+    return app.$('estimateDetail').textContent;
+  };
+  assert.match(await note('and again'), /Already cached/);
+  fs.writeFileSync(path.join(app.workspace, 'LOCALPILOT.md'), '# Notes\nUse Python.\n');
+  assert.match(await note('and again'), /The LOCALPILOT\.md notes changed since the last message, so the whole chat is read again\./);
+  fs.rmSync(path.join(app.workspace, 'LOCALPILOT.md'));
+  await app.click('Low');
+  await sleep(50);
+  assert.match(await note('and again'), /Effort, mode or tools changed since the last message/);
+  await app.click('Medium');
+  await sleep(50);
+  assert.match(await note('and again'), /Already cached/);
+}));
+
+run('agent');

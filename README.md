@@ -16,6 +16,7 @@ Needs macOS on Apple Silicon, Node.js 18+ and LM Studio with its `lms` CLI.
 npm install
 npm start          # run in development
 npm run package    # build dist/LocalPilot-darwin-arm64/LocalPilot.app
+npm test           # agent loop, file tools and streaming, against a scripted model (~10 s)
 ```
 
 ## How to use it
