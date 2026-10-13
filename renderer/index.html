@@ -6,6 +6,7 @@
         content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>LocalPilot</title>
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="memory.css">
 </head>
 <body>
   <div id="brain" aria-hidden="true"><canvas id="brainCanvas"></canvas><canvas id="brainLive"></canvas></div>
@@ -24,6 +25,7 @@
       <div class="side-tools">
         <button id="compareBtn" class="btn ghost small" title="Run one prompt on two models side by side">Compare models</button>
         <button id="promptsBtn" class="btn ghost small" title="Saved prompts you can use with /name">Saved prompts</button>
+        <button id="memoryBtn" class="btn ghost small" title="Journal, skills and notes the model keeps">Memory &amp; skills <span id="memoryBadge" class="badge hidden">0</span></button>
       </div>
       <div class="section-label">Chats</div>
       <ul id="chatList" class="chat-list"></ul>
@@ -56,6 +58,7 @@
               <button data-value="low" title="No thinking, short answers, up to 8 steps">Low</button>
               <button data-value="medium" title="Thinks before answering, up to 16 steps">Medium</button>
               <button data-value="high" title="Thinks, up to 30 steps, verifies its work">High</button>
+              <button data-value="auto" title="Starts fast without thinking, and turns thinking on if a check fails, tools keep failing, or the task runs long. Up to 20 steps">Auto</button>
             </div>
           </div>
 
@@ -203,6 +206,75 @@
       <div class="compare-grid">
         <div class="compare-col"><div id="compareHeadA" class="compare-head"></div><div id="compareOutA" class="content"></div></div>
         <div class="compare-col"><div id="compareHeadB" class="compare-head"></div><div id="compareOutB" class="content"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="memoryModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="memoryTitle">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2 id="memoryTitle">Memory &amp; skills</h2>
+        <button class="btn ghost small close-modal" aria-label="Close">✕</button>
+      </div>
+      <p class="muted small">When the app has been idle for 2 minutes with a model loaded, it summarizes finished chats into a journal,
+        then proposes updates to your LOCALPILOT.md notes. Notes only change when you approve. The model can search the journal and load skills.</p>
+
+      <div class="modal-section">
+        <h3>Proposed note updates</h3>
+        <div id="proposalList"></div>
+      </div>
+
+      <div class="modal-section">
+        <div class="row space">
+          <h3>Skills</h3>
+          <div class="row">
+            <button id="revealSkillsBtn" class="btn ghost small">Open folder</button>
+            <button id="newSkillBtn" class="btn small">New skill</button>
+          </div>
+        </div>
+        <table class="model-table">
+          <thead><tr><th>Name</th><th>When to use it</th><th></th></tr></thead>
+          <tbody id="skillRows"></tbody>
+        </table>
+      </div>
+
+      <div class="modal-section">
+        <div class="row space">
+          <h3>Journal</h3>
+          <button id="upkeepNowBtn" class="btn small">Summarize now</button>
+        </div>
+        <p class="small"><span id="journalStatus"></span> · <span id="upkeepStatus" class="muted" aria-live="polite"></span></p>
+        <div id="journalList"></div>
+      </div>
+
+      <div class="modal-section">
+        <div class="row space">
+          <h3>Rated answers</h3>
+          <button id="revealExamplesBtn" class="btn ghost small">Open folder</button>
+        </div>
+        <p class="muted small"><span id="exampleCount"></span> Each 👍 saves that conversation as a training example, ready for a LoRA fine-tune once you have a few hundred.</p>
+      </div>
+    </div>
+  </div>
+
+  <div id="skillModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="skillTitle">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2 id="skillTitle">Skill</h2>
+        <button class="btn ghost small close-modal" aria-label="Close">✕</button>
+      </div>
+      <div class="skill-form">
+        <label for="skillName" class="muted small">Name (lowercase, dashes)</label>
+        <input id="skillName" type="text" placeholder="e.g. flask-api-with-tests">
+        <label for="skillDesc" class="muted small">When to use it (one line; the model sees this in every chat)</label>
+        <input id="skillDesc" type="text" placeholder="e.g. Building a small Flask JSON API with pytest tests">
+        <label for="skillBody" class="muted small">Instructions and a worked example (loaded only when needed)</label>
+        <textarea id="skillBody" rows="14"></textarea>
+        <div class="row">
+          <span id="skillStatus" class="small muted" aria-live="polite"></span>
+          <span class="spacer"></span>
+          <button id="skillSave" class="btn primary">Save skill</button>
+        </div>
       </div>
     </div>
   </div>

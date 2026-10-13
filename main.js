@@ -3,6 +3,7 @@
 
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
@@ -143,7 +144,16 @@ app.whenReady().then(() => {
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 app.on('window-all-closed', () => app.quit());
-app.on('before-quit', () => stopEngine());
+// Save the open chat's cache before the engine goes away, so it starts warm next launch.
+let quitting = false;
+app.on('before-quit', (e) => {
+  if (quitting) return;
+  quitting = true;
+  e.preventDefault();
+  const save = engine?.slotOwner ? saveSlot(engine.slotOwner) : Promise.resolve();
+  Promise.race([save, new Promise((r) => setTimeout(r, 10_000))])
+    .finally(() => stopEngine().finally(() => app.quit()));
+});
 process.on('exit', () => { try { engine?.child.kill('SIGKILL'); } catch { /* already gone */ } });
 
 const send = (channel, payload) => { if (win && !win.isDestroyed()) win.webContents.send(channel, payload); };
@@ -202,7 +212,15 @@ ipcMain.handle('chats:save', async (_e, chat) => {
 });
 
 ipcMain.handle('chats:delete', async (_e, id) => {
-  await fsp.rm(path.join(chatsDir(), safeChatId(id) + '.json'), { force: true });
+  const chatId = safeChatId(id);
+  await fsp.rm(path.join(chatsDir(), chatId + '.json'), { force: true });
+  // Remove what was derived from the chat too: its saved cache, journal entry and rated answers.
+  await fsp.rm(path.join(journalDir(), chatId + '.json'), { force: true });
+  for (const dir of [kvDir(), examplesDir()]) {
+    const files = await fsp.readdir(dir).catch(() => []);
+    for (const f of files) if (f.startsWith(chatId + '-')) await fsp.rm(path.join(dir, f), { force: true });
+  }
+  if (engine?.slotOwner === chatId) engine.slotOwner = null;
   return true;
 });
 
@@ -267,7 +285,15 @@ function startEngine(model, contextLength) {
     // Speed: a multi-token-prediction draft model, measured ~30% faster for Gemma 4 on this Mac.
     const MTP_DRAFTS = { gemma4: path.join(os.homedir(), 'models', 'mtp-gemma-4-12B-it.gguf') };
     const draft = MTP_DRAFTS[model.architecture];
-    if (draft && fs.existsSync(draft)) args.push('-md', draft, '--spec-type', 'draft-mtp');
+    const hasDraft = !!draft && fs.existsSync(draft);
+    if (hasDraft) args.push('-md', draft, '--spec-type', 'draft-mtp');
+    // Keep at most 2 GiB of recent prompt states in RAM (the 8 GiB default is half this Mac),
+    // and let each chat's cache be saved to disk. Slot files don't cover a draft model's state.
+    args.push('--cache-ram', '2048');
+    if (!hasDraft) {
+      fs.mkdirSync(kvDir(), { recursive: true });
+      args.push('--slot-save-path', kvDir());
+    }
     // Vision: load the projector file that sits next to the model, if there is one.
     try {
       const dir = path.dirname(path.join(LMS_MODELS, model.path));
@@ -297,7 +323,10 @@ function startEngine(model, contextLength) {
       finish({ ok: false, error: `Engine stopped while loading (${signal ?? code}): ${reason.trim()}` });
     });
     child.on('error', (err) => finish({ ok: false, error: `Could not start engine: ${err.message}` }));
-    engine = { child, modelKey: model.modelKey, displayName: model.displayName, contextLength, ready: false };
+    engine = {
+      child, modelKey: model.modelKey, displayName: model.displayName, contextLength, ready: false,
+      slotSave: !hasDraft, slotOwner: null,  // slotOwner: the chat whose prompt is in the cache now
+    };
     setTimeout(() => {
       if (!settled) {
         stopEngine();
@@ -329,6 +358,7 @@ ipcMain.handle('models:estimate', async (_e, { modelKey, contextLength }) => {
 
 ipcMain.handle('models:load', async (_e, { modelKey, contextLength }) => {
   // Only one model fits in GPU memory at a time, whichever engine runs it.
+  if (engine?.slotOwner) await saveSlot(engine.slotOwner);
   await stopEngine();
   killOrphanEngines();
   await runLms(['unload', '--all'], { timeoutMs: 60_000 });
@@ -372,10 +402,11 @@ ipcMain.handle('models:download', async (_e, { query, requestId }) => {
 
 // ---------- IPC: streaming chat completions ----------
 
-ipcMain.handle('chat:stream', async (_e, { requestId, body }) => {
+ipcMain.handle('chat:stream', async (_e, { requestId, body, slotOwner = null }) => {
   const controller = new AbortController();
   streams.set(requestId, controller);
   const onEngine = engine?.ready && engine.modelKey === body.model;
+  if (onEngine) await prepareSlot(slotOwner ? safeChatId(slotOwner) : null);
   const base = onEngine ? ENGINE_API : API;
   const payload = { ...body, stream: true, stream_options: { include_usage: true } };
   if (onEngine && payload.reasoning_effort === 'none') {
@@ -444,6 +475,78 @@ ipcMain.handle('chat:abort', (_e, requestId) => {
   if (child) child.kill('SIGTERM');
   return true;
 });
+
+// ---------- per-chat cache (LocalPilot engine) ----------
+// The engine runs one slot, so another chat (or a background summary) throws the current
+// chat's processed prompt away. Save it to disk first, and restore a chat's file when it comes
+// back; llama-server then only processes what changed since. Files are per model and context.
+
+const kvDir = () => path.join(dataDir(), 'kvcache');
+const KV_BUDGET_BYTES = 3 * 1024 ** 3;
+
+function kvFile(chatId) {
+  const fp = crypto.createHash('sha1').update(`${engine.modelKey}|${engine.contextLength}`).digest('hex').slice(0, 10);
+  return `${chatId}-${fp}.bin`;
+}
+
+async function slotAction(action, filename) {
+  const res = await fetch(`http://127.0.0.1:${ENGINE_PORT}/slots/0?action=${action}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename }),
+    signal: AbortSignal.timeout(60_000),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error?.message || `HTTP ${res.status}`);
+  return json;
+}
+
+async function saveSlot(chatId) {
+  if (!engine?.ready || !engine.slotSave || !chatId) return;
+  try {
+    await slotAction('save', kvFile(chatId));
+    await pruneKvCache();
+  } catch (err) {
+    console.warn(`Could not save the cache for chat ${chatId}: ${err.message}`);
+  }
+}
+
+async function restoreSlot(chatId) {
+  const name = kvFile(chatId);
+  const file = path.join(kvDir(), name);
+  if (!fs.existsSync(file)) return;
+  try {
+    await slotAction('restore', name);
+    const now = new Date();
+    await fsp.utimes(file, now, now);  // most recently used survives pruning
+  } catch (err) {
+    console.warn(`Could not restore the cache for chat ${chatId}: ${err.message}`);
+  }
+}
+
+async function prepareSlot(owner) {
+  if (!engine?.slotSave || engine.slotOwner === owner) return;
+  if (engine.slotOwner) await saveSlot(engine.slotOwner);
+  engine.slotOwner = owner;
+  if (owner) await restoreSlot(owner);
+}
+
+// Keep the cache folder under budget by dropping the least recently used files.
+async function pruneKvCache() {
+  const files = [];
+  for (const f of await fsp.readdir(kvDir()).catch(() => [])) {
+    try {
+      const st = await fsp.stat(path.join(kvDir(), f));
+      files.push({ f, size: st.size, mtime: st.mtimeMs });
+    } catch { /* removed meanwhile */ }
+  }
+  files.sort((a, b) => b.mtime - a.mtime);
+  let total = 0;
+  for (const { f, size } of files) {
+    total += size;
+    if (total > KV_BUDGET_BYTES) await fsp.rm(path.join(kvDir(), f), { force: true });
+  }
+}
 
 // ---------- IPC: tools ----------
 
@@ -781,11 +884,17 @@ ipcMain.handle('tool:fetch_url', async (_e, { url }) => {
 
 // ---------- project memory ----------
 
+const NOTES_LIMIT = 4000;  // characters of each LOCALPILOT.md that go into the prompt
+
 ipcMain.handle('memory:read', async (_e, { project }) => {
   const ws = readSettings().workspace;
+  // Cut at a line break so the model never sees half a note; report the full size.
   const read = async (p) => {
     try {
-      return (await fsp.readFile(p, 'utf8')).slice(0, 4000);
+      const text = await fsp.readFile(p, 'utf8');
+      if (text.length <= NOTES_LIMIT) return { text, size: text.length };
+      const cut = text.lastIndexOf('\n', NOTES_LIMIT);
+      return { text: text.slice(0, cut > NOTES_LIMIT / 2 ? cut : NOTES_LIMIT), size: text.length };
     } catch {
       return null;
     }
@@ -797,11 +906,266 @@ ipcMain.handle('memory:read', async (_e, { project }) => {
       proj = await read(path.join(await resolveInWorkspace(project), 'LOCALPILOT.md'));
     } catch { /* outside workspace */ }
   }
-  return { root, project: proj };
+  return {
+    root: root?.text ?? null, rootSize: root?.size ?? 0,
+    project: proj?.text ?? null, projectSize: proj?.size ?? 0,
+    limit: NOTES_LIMIT,
+  };
 });
 
 ipcMain.handle('tool:open_path', async (_e, { path: rel }) => {
   const abs = await resolveInWorkspace(rel);
   const err = await shell.openPath(abs);
   return err ? `Could not open ${rel}: ${err}` : `Opened ${rel}`;
+});
+
+// ---------- memory layer ----------
+// Three stores, like episodic / semantic / procedural memory:
+//   journal/   one dated summary per chat (events), searched only when needed
+//   LOCALPILOT.md files in the workspace (facts), always loaded; updated only with approval
+//   skills/    instructions and worked examples (skills), loaded by the model on demand
+
+const journalDir = () => path.join(dataDir(), 'journal');
+const skillsDir = () => path.join(dataDir(), 'skills');
+const examplesDir = () => path.join(dataDir(), 'examples');
+const proposalsFile = () => path.join(dataDir(), 'note-proposals.json');
+const memoryStateFile = () => path.join(dataDir(), 'memory-state.json');
+
+async function readJson(file, fallback) {
+  try {
+    return JSON.parse(await fsp.readFile(file, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeJson(file, data) {
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  await fsp.writeFile(file, JSON.stringify(data, null, 2));
+}
+
+async function readAllJson(dir) {
+  const out = [];
+  for (const f of (await fsp.readdir(dir).catch(() => [])).filter((x) => x.endsWith('.json'))) {
+    const j = await readJson(path.join(dir, f), null);
+    if (j) out.push(j);
+  }
+  return out;
+}
+
+const visibleText = (content) => (Array.isArray(content)
+  ? content.filter((p) => p.type === 'text').map((p) => p.text).join('\n')
+  : String(content ?? ''));
+
+// ----- journal (events) -----
+
+ipcMain.handle('journal:list', async () => (await readAllJson(journalDir())).sort((a, b) => b.date - a.date));
+
+ipcMain.handle('journal:save', async (_e, entry) => {
+  if (!fs.existsSync(path.join(chatsDir(), safeChatId(entry.chatId) + '.json'))) return false;  // deleted meanwhile
+  await writeJson(path.join(journalDir(), safeChatId(entry.chatId) + '.json'), entry);
+  return true;
+});
+
+// Chats that changed since they were last summarized and have an actual answer in them.
+ipcMain.handle('journal:pending', async (_e, { exclude } = {}) => {
+  const journal = new Map((await readAllJson(journalDir())).map((j) => [j.chatId, j]));
+  const pending = [];
+  for (const c of await readAllJson(chatsDir())) {
+    if (c.id === exclude) continue;
+    if ((journal.get(c.id)?.chatUpdatedAt ?? 0) >= c.updatedAt) continue;
+    if (!c.messages?.some((m) => m.role === 'assistant' && m.content)) continue;
+    pending.push({ id: c.id, updatedAt: c.updatedAt });
+  }
+  return pending.sort((a, b) => b.updatedAt - a.updatedAt).map((p) => p.id);
+});
+
+// ----- search_history -----
+
+ipcMain.handle('history:search', async (_e, { query, excludeChatId }) => {
+  const terms = [...new Set(String(query || '').toLowerCase().split(/[^\p{L}\p{N}_.-]+/u).filter((t) => t.length > 1))];
+  if (!terms.length) throw new Error('query is required.');
+  const journal = new Map((await readAllJson(journalDir())).map((j) => [j.chatId, j]));
+  const count = (text, t) => text.split(t).length - 1;
+  const results = [];
+  for (const c of await readAllJson(chatsDir())) {
+    if (c.id === excludeChatId) continue;
+    const summary = (journal.get(c.id)?.summary || '').toLowerCase();
+    const title = (c.title || '').toLowerCase();
+    const body = (c.messages || []).filter((m) => (m.role === 'user' && !m.hidden) || m.role === 'assistant')
+      .map((m) => visibleText(m.content)).join('\n');
+    const lower = body.toLowerCase();
+    let score = 0;
+    let matched = 0;
+    for (const t of terms) {
+      const hits = 3 * count(summary, t) + 3 * count(title, t) + Math.min(count(lower, t), 10);
+      if (hits) matched++;
+      score += hits;
+    }
+    if (!score) continue;
+    // Favor chats that match more of the words, and recent ones, without hiding old exact matches.
+    const ageDays = (Date.now() - (c.updatedAt || 0)) / 86_400_000;
+    score *= (matched / terms.length) * (0.6 + 0.4 * Math.exp(-ageDays / 60));
+    const snippets = [];
+    for (const t of terms) {
+      const i = lower.indexOf(t);
+      if (i >= 0 && snippets.length < 2) snippets.push('…' + body.slice(Math.max(0, i - 120), i + 160).replace(/\s+/g, ' ').trim() + '…');
+    }
+    results.push({ c, score, summary: journal.get(c.id)?.summary, snippets });
+  }
+  results.sort((a, b) => b.score - a.score);
+  if (!results.length) return `No earlier chats match "${query}".`;
+  return results.slice(0, 5).map(({ c, summary, snippets }) => {
+    const date = new Date(c.updatedAt).toISOString().slice(0, 10);
+    const head = `## ${date} · ${c.title}${c.project ? ` · project ${c.project}` : ''}`;
+    return [head, summary ? `Summary:\n${summary}` : null, snippets.length ? `Matching text:\n${snippets.join('\n')}` : null]
+      .filter(Boolean).join('\n');
+  }).join('\n\n').slice(0, MAX_TOOL_OUTPUT);
+});
+
+// ----- skills (procedures) -----
+
+const SKILL_NAME = /^[a-z0-9][a-z0-9-]{0,40}$/;
+
+function parseSkill(text, fallbackName) {
+  const m = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  const meta = {};
+  for (const line of (m ? m[1] : '').split('\n')) {
+    const kv = line.match(/^(\w+):\s*(.*)$/);
+    if (kv) meta[kv[1]] = kv[2].trim();
+  }
+  return { name: meta.name || fallbackName, description: meta.description || '', body: (m ? m[2] : text).trim() };
+}
+
+ipcMain.handle('skills:list', async () => {
+  const out = [];
+  for (const f of (await fsp.readdir(skillsDir()).catch(() => [])).filter((x) => x.endsWith('.md'))) {
+    const s = parseSkill(await fsp.readFile(path.join(skillsDir(), f), 'utf8'), f.slice(0, -3));
+    out.push({ name: f.slice(0, -3), description: s.description });
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+});
+
+ipcMain.handle('skills:get', async (_e, name) => {
+  if (!SKILL_NAME.test(String(name))) throw new Error(`No skill named "${name}".`);
+  try {
+    return parseSkill(await fsp.readFile(path.join(skillsDir(), name + '.md'), 'utf8'), name);
+  } catch {
+    throw new Error(`No skill named "${name}".`);
+  }
+});
+
+ipcMain.handle('skills:save', async (_e, { name, description, body, previousName }) => {
+  if (!SKILL_NAME.test(String(name))) throw new Error('Use lowercase letters, numbers and dashes for the name.');
+  const oneLine = String(description || '').replace(/\s+/g, ' ').trim();
+  await fsp.mkdir(skillsDir(), { recursive: true });
+  await fsp.writeFile(path.join(skillsDir(), name + '.md'), `---\nname: ${name}\ndescription: ${oneLine}\n---\n\n${String(body || '').trim()}\n`);
+  if (previousName && previousName !== name && SKILL_NAME.test(previousName)) {
+    await fsp.rm(path.join(skillsDir(), previousName + '.md'), { force: true });
+  }
+  return true;
+});
+
+ipcMain.handle('skills:delete', async (_e, name) => {
+  if (SKILL_NAME.test(String(name))) await fsp.rm(path.join(skillsDir(), name + '.md'), { force: true });
+  return true;
+});
+
+ipcMain.handle('skills:reveal', async () => {
+  await fsp.mkdir(skillsDir(), { recursive: true });
+  return shell.openPath(skillsDir());
+});
+
+// ----- LOCALPILOT.md update proposals (facts) -----
+
+async function notesPath(project) {
+  return resolveInWorkspace(project ? path.join(project, 'LOCALPILOT.md') : 'LOCALPILOT.md');
+}
+
+ipcMain.handle('notes:get', async (_e, { project }) => {
+  const abs = await notesPath(project);
+  const rel = project ? `${project}/LOCALPILOT.md` : 'LOCALPILOT.md';
+  try {
+    return { rel, exists: true, content: (await fsp.readFile(abs, 'utf8')).slice(0, 50_000) };
+  } catch {
+    return { rel, exists: false, content: '' };
+  }
+});
+
+ipcMain.handle('proposals:list', async () => readJson(proposalsFile(), []));
+
+ipcMain.handle('proposals:add', async (_e, p) => {
+  const all = await readJson(proposalsFile(), []);
+  all.push({ ...p, id: crypto.randomUUID(), status: 'pending', createdAt: Date.now() });
+  // Keep the pending ones and the last few decisions (for undo).
+  const decided = all.filter((x) => x.status !== 'pending').slice(-10);
+  await writeJson(proposalsFile(), [...decided, ...all.filter((x) => x.status === 'pending')]);
+  return true;
+});
+
+ipcMain.handle('proposals:resolve', async (_e, { id, action, content }) => {
+  const all = await readJson(proposalsFile(), []);
+  const p = all.find((x) => x.id === id);
+  if (!p || p.status !== 'pending') return { ok: false, error: 'This proposal was already handled.' };
+  if (p.workspace !== readSettings().workspace) return { ok: false, error: 'This proposal is for a different workspace.' };
+  if (action === 'apply') {
+    const abs = await notesPath(p.project);
+    const current = await fsp.readFile(abs, 'utf8').catch(() => '');
+    if (current !== p.before) {
+      return { ok: false, error: `${p.rel} changed after this was proposed, so applying it could undo your edits. Reject it, or copy what you want from Edit into the file yourself.` };
+    }
+    const next = String(content ?? p.after).trimEnd() + '\n';
+    await fsp.mkdir(path.dirname(abs), { recursive: true });
+    await fsp.writeFile(abs, next);
+    Object.assign(p, { status: 'applied', applied: next, decidedAt: Date.now() });
+  } else {
+    Object.assign(p, { status: 'rejected', decidedAt: Date.now() });
+  }
+  await writeJson(proposalsFile(), all);
+  return { ok: true };
+});
+
+ipcMain.handle('proposals:undo', async (_e, { id }) => {
+  const all = await readJson(proposalsFile(), []);
+  const p = all.find((x) => x.id === id && x.status === 'applied');
+  if (!p) return { ok: false, error: 'Nothing to undo.' };
+  if (p.workspace !== readSettings().workspace) return { ok: false, error: 'This change was made in a different workspace.' };
+  const abs = await notesPath(p.project);
+  const current = await fsp.readFile(abs, 'utf8').catch(() => '');
+  if (current !== p.applied) return { ok: false, error: `${p.rel} was edited after this change, so it can't be undone safely.` };
+  if (p.existed) await fsp.writeFile(abs, p.before);
+  else await fsp.rm(abs, { force: true });
+  p.status = 'undone';
+  await writeJson(proposalsFile(), all);
+  return { ok: true };
+});
+
+ipcMain.handle('memstate:get', async () => readJson(memoryStateFile(), { consolidatedAt: {} }));
+
+ipcMain.handle('memstate:mark', async (_e, { key, at }) => {
+  const s = await readJson(memoryStateFile(), { consolidatedAt: {} });
+  s.consolidatedAt = { ...s.consolidatedAt, [key]: Math.max(at, s.consolidatedAt?.[key] ?? 0) };
+  await writeJson(memoryStateFile(), s);
+  return s;
+});
+
+// ----- rated answers (future fine-tuning data) -----
+
+const safeExampleId = (id) => String(id).replace(/[^a-zA-Z0-9_-]/g, '');
+
+ipcMain.handle('examples:save', async (_e, { id, record }) => {
+  await writeJson(path.join(examplesDir(), safeExampleId(id) + '.json'), record);
+  return true;
+});
+
+ipcMain.handle('examples:delete', async (_e, id) => {
+  await fsp.rm(path.join(examplesDir(), safeExampleId(id) + '.json'), { force: true });
+  return true;
+});
+
+ipcMain.handle('examples:count', async () => (await fsp.readdir(examplesDir()).catch(() => [])).filter((f) => f.endsWith('.json')).length);
+
+ipcMain.handle('examples:reveal', async () => {
+  await fsp.mkdir(examplesDir(), { recursive: true });
+  return shell.openPath(examplesDir());
 });

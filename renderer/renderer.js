@@ -10,7 +10,11 @@ const EFFORT = {
     reasoning: null, maxTokens: 6144, maxSteps: 30,
     hint: 'Think carefully. After changing files, read them back or run them to check your work, and fix any problems before you finish.',
   },
+  // Fast first, slow when needed: starts without thinking, and turns thinking on (same model,
+  // same cached prompt) once a check fails, tools keep failing, or the task runs long.
+  auto: { reasoning: 'none', maxTokens: 4096, maxSteps: 20, hint: '', escalateTo: 'medium' },
 };
+const ESCALATE_AFTER_STEPS = 6;
 
 const ENGINE_LABEL = { lmstudio: 'LM Studio', llamacpp: 'LocalPilot engine' };
 const AUTO_COMPACT_AT = 0.8;
@@ -146,7 +150,27 @@ const WEB_TOOLS = [
   },
 ];
 
-const activeTools = () => (state.settings.web ? [...BASE_TOOLS, ...WEB_TOOLS] : BASE_TOOLS);
+const MEMORY_TOOLS = [
+  {
+    name: 'search_history',
+    description: 'Search the user\'s earlier chats (their summaries and messages). Use it when the user refers to past work ("like last time", "the script we made") or when earlier decisions would help. Returns dated matches.',
+    parameters: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'A few keywords, e.g. "nginx log parser".' } },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'load_skill',
+    description: 'Load one of the skills listed in the system prompt: proven instructions and a worked example for a recurring task. Load the matching skill before starting that kind of task.',
+    parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+  },
+];
+
+function activeTools() {
+  const memory = MEMORY_TOOLS.filter((t) => t.name !== 'load_skill' || state.skills.length);
+  return [...BASE_TOOLS, ...memory, ...(state.settings.web ? WEB_TOOLS : [])];
+}
 
 const state = {
   settings: null,
@@ -163,6 +187,10 @@ const state = {
   loadErrors: {},  // modelKey -> last load error
   attachments: [], // [{ dataUrl, name }] waiting to be sent
   slashIndex: 0,
+  skills: [],      // [{ name, description }] the model can load
+  upkeep: null,    // the background memory job, if one is running
+  lastActivity: Date.now(),
+  notesWarned: new Set(),
 };
 
 // ---------- utilities ----------
@@ -340,6 +368,7 @@ function explainLoadError(error) {
 }
 
 async function loadModel(modelKey, contextLength = state.settings.contextLength) {
+  await stopUpkeep();
   // Loading unloads everything first, so remember what was working to restore it on failure.
   const previous = state.models.loaded[0];
   state.loadingModel = 'loading 0%';
@@ -523,6 +552,7 @@ function newChatObject() {
     usage: { prompt: 0, completion: 0, reasoning: 0, cached: 0, requests: 0 },
     lastSpeed: null,
     project: null,
+    workspace: state.settings?.workspace ?? null,
     trustedUrls: [],
   };
 }
@@ -595,6 +625,8 @@ function renderConversation() {
           currentAssistant.tools.append(historicToolView(tc, result));
         }
         if (m.meta) currentAssistant.meta.textContent = m.meta;
+        if (m.content && !m.tool_calls?.length) currentAssistant.actions.append(...answerActions(m));
+        if (m.sourceCheck) currentAssistant.extra.append(sourceCheckCard(m.sourceCheck));
       } else if (m.role === 'notice') {
         box.append(el('div', { class: 'notice', text: m.content }));
       } else if (m.role === 'undo') {
@@ -650,10 +682,13 @@ function assistantView() {
   const thinking = el('details', { class: 'thinking hidden' }, thinkingSummary, thinkingBody);
   const content = el('div', { class: 'content' });
   const tools = el('div', { class: 'tools' });
+  const extra = el('div', { class: 'extra' });
   const meta = el('div', { class: 'meta' });
-  const root = el('div', { class: 'msg assistant' }, el('div', { class: 'who', text: 'Assistant' }), thinking, content, tools, meta);
+  const actions = el('span', { class: 'answer-actions' });
+  const root = el('div', { class: 'msg assistant' }, el('div', { class: 'who', text: 'Assistant' }), thinking, content, tools, extra,
+    el('div', { class: 'footer' }, meta, actions));
   return {
-    root, content, tools, meta,
+    root, content, tools, extra, meta, actions,
     setReasoning(text, live) {
       thinking.classList.remove('hidden');
       thinkingBody.textContent = text;
@@ -671,6 +706,8 @@ function toolLabel(name, args) {
   if (name === 'ask_user') return args.question ?? '';
   if (name === 'web_search') return args.query ?? '';
   if (name === 'fetch_url') return args.url ?? '';
+  if (name === 'search_history') return args.query ?? '';
+  if (name === 'load_skill') return args.name ?? '';
   return '';
 }
 
@@ -699,6 +736,50 @@ function historicToolView(tc, result) {
     card.append(body);
   }
   return card;
+}
+
+// ---------- answer actions: rate, save as skill ----------
+
+function answerActions(msg) {
+  const up = el('button', {
+    class: `rate-btn${msg.rating === 'up' ? ' on' : ''}`,
+    title: 'Good answer: keep this conversation as an example for fine-tuning later',
+    'aria-label': 'Good answer',
+    'aria-pressed': String(msg.rating === 'up'),
+    text: '👍',
+  });
+  up.addEventListener('click', async () => {
+    if (msg.rating === 'up') {
+      await api.deleteExample(msg.exampleId);
+      delete msg.rating;
+      delete msg.exampleId;
+    } else {
+      msg.exampleId = `${state.chat.id}-${uid()}`;
+      msg.rating = 'up';
+      await api.saveExample({ id: msg.exampleId, record: exampleRecord(msg) });
+    }
+    up.classList.toggle('on', msg.rating === 'up');
+    up.setAttribute('aria-pressed', String(msg.rating === 'up'));
+    await api.saveChat(state.chat);  // not saveChat(): a rating isn't new activity in the chat
+  });
+  const skill = el('button', { class: 'btn ghost small', text: 'Save as skill', title: 'Turn how this was done into a reusable skill' });
+  skill.addEventListener('click', () => draftSkill(msg));
+  return [up, skill];
+}
+
+// The conversation up to this answer in chat-completions format, with images left out.
+function exampleRecord(msg) {
+  const upto = state.chat.messages.slice(0, state.chat.messages.indexOf(msg) + 1);
+  const messages = toApiMessages(upto).map((m) => (Array.isArray(m.content)
+    ? { ...m, content: m.content.map((p) => (p.type === 'image_url' ? { type: 'text', text: '[image]' } : p)) }
+    : m));
+  return {
+    createdAt: new Date().toISOString(),
+    model: state.settings.model,
+    chatId: state.chat.id,
+    tools: state.settings.mode !== 'chat' ? activeTools() : [],
+    messages: [{ role: 'system', content: systemPrompt() }, ...messages],
+  };
 }
 
 // ---------- undo ----------
@@ -773,14 +854,38 @@ function systemPrompt(memory = {}) {
     }
   }
   if (effort.hint) lines.push(effort.hint);
-  if (memory.root) lines.push(`\nNotes from the workspace LOCALPILOT.md:\n${memory.root}`);
-  if (memory.project) lines.push(`\nNotes from ${state.chat.project}/LOCALPILOT.md (the current project):\n${memory.project}`);
+  if (mode !== 'chat' && state.skills.length) {
+    lines.push(`\nSkills you can load with load_skill (load the matching one before starting that kind of task):\n${state.skills.map((s) => `- ${s.name}: ${s.description}`).join('\n')}`);
+  }
+  const cutNote = (size) => (size > memory.limit
+    ? `\n(Only the first ${fmt(memory.limit)} of ${fmt(size)} characters are shown. When you next update this file, shorten it: merge duplicates and remove stale notes.)`
+    : '');
+  if (memory.root) lines.push(`\nNotes from the workspace LOCALPILOT.md:\n${memory.root}${cutNote(memory.rootSize)}`);
+  if (memory.project) lines.push(`\nNotes from ${state.chat.project}/LOCALPILOT.md (the current project):\n${memory.project}${cutNote(memory.projectSize)}`);
   return lines.join('\n');
 }
 
+// Tell the user once per chat when a notes file is too long to fit in the prompt.
+function warnCutNotes(memory) {
+  const files = [
+    ['LOCALPILOT.md', memory.rootSize],
+    [`${state.chat.project}/LOCALPILOT.md`, memory.projectSize],
+  ];
+  for (const [file, size] of files) {
+    const key = `${state.chat.id}|${file}|${size}`;
+    if (!(size > memory.limit) || state.notesWarned.has(key)) continue;
+    state.notesWarned.add(key);
+    notice(`${file} is ${fmt(size)} characters; only the first ${fmt(memory.limit)} reach the model. Shorten it, or approve a tidy-up in Memory & skills.`, 'error');
+  }
+}
+
 function apiMessages(memory) {
-  const out = [{ role: 'system', content: systemPrompt(memory) }];
-  for (const m of state.chat.messages) {
+  return [{ role: 'system', content: systemPrompt(memory) }, ...toApiMessages(state.chat.messages)];
+}
+
+function toApiMessages(messages) {
+  const out = [];
+  for (const m of messages) {
     if (m.role === 'user') out.push({ role: 'user', content: m.content });
     else if (m.role === 'assistant') {
       const msg = { role: 'assistant', content: m.content || '' };
@@ -811,10 +916,13 @@ function fitToContext(maxTokens, memory) {
 
 // ---------- streaming ----------
 
-function streamOnce(body, view) {
+// slotOwner: the chat this request continues, so the engine can keep (or bring back) its cache.
+// job: a background upkeep job; its request is stopped through the job, not the Stop button.
+function streamOnce(body, view, { slotOwner = null, job = null } = {}) {
   return new Promise((resolve) => {
     const requestId = uid();
-    state.requestId = requestId;
+    if (job) job.requestId = requestId;
+    else state.requestId = requestId;
     let content = '';
     let reasoning = '';
     const toolCalls = [];
@@ -854,7 +962,7 @@ function streamOnce(body, view) {
       scheduleRender();
     });
 
-    api.streamChat({ requestId, body }).then((res) => {
+    api.streamChat({ requestId, body, slotOwner }).then((res) => {
       off();
       const seconds = firstTokenAt ? (performance.now() - firstTokenAt) / 1000 : 0;
       resolve({ ...res, content, reasoning, toolCalls: toolCalls.filter(Boolean), usage, seconds, finishReason });
@@ -1029,13 +1137,25 @@ async function runAgent() {
   setBusy(true);
   const runId = uid();
   try {
+    await stopUpkeep();
     if (!(await ensureModelReady())) return;
+    await refreshSkills();  // the user may have added or edited skill files
     const effort = EFFORT[state.settings.effort];
-    const maxTokens = Math.min(effort.maxTokens, Math.floor((state.contextMax || 8192) / 2));
     const tools = state.settings.mode !== 'chat' ? activeTools() : null;
+    // Read the notes once per run: if the agent edits LOCALPILOT.md mid-run, a changing system
+    // prompt would make the engine reprocess the whole conversation on every later step.
+    const memory = await loadMemory();
+    warnCutNotes(memory);
+    let escalated = false;
+    let toolErrors = 0;
+    let usedWeb = false;
+    let finalMsg = null;
+    let finalView = null;
 
     for (let step = 0; step < effort.maxSteps; step++) {
       if (state.stopRequested) break;
+      const effortKey = escalated ? effort.escalateTo : state.settings.effort;
+      const maxTokens = Math.min(EFFORT[effortKey].maxTokens, Math.floor((state.contextMax || 8192) / 2));
 
       // Summarize instead of overflowing once the context gets ~80% full.
       if (state.contextMax && state.contextUsed > state.contextMax * AUTO_COMPACT_AT
@@ -1044,7 +1164,6 @@ async function runAgent() {
         await compactCore({ continuing: step > 0, keepLastUser: step === 0 });
       }
 
-      const memory = await loadMemory();
       if (fitToContext(maxTokens, memory)) renderConversation();
 
       const view = assistantView();
@@ -1052,7 +1171,7 @@ async function runAgent() {
       view.meta.textContent = 'working…';
       scrollToBottom(true);
 
-      const res = await streamOnce(requestBody(apiMessages(memory), { maxTokens, tools }), view);
+      const res = await streamOnce(requestBody(apiMessages(memory), { maxTokens, tools, effortKey }), view, { slotOwner: state.chat.id });
       if (!res.ok) {
         view.meta.textContent = '';
         notice(res.error, 'error');
@@ -1067,17 +1186,44 @@ async function runAgent() {
       if (!res.content && !res.toolCalls.length && res.finishReason === 'length') {
         notice(`The model used its whole ${fmt(maxTokens)}-token output budget ${res.reasoning ? 'thinking' : 'writing'} and stopped before answering. Try Low effort (no thinking), raise the context size, or ask a narrower question.`, 'error');
       }
-      if (res.aborted || !res.toolCalls.length) break;
+      if (res.aborted || !res.toolCalls.length) {
+        if (!res.aborted && res.content) {
+          finalMsg = assistantMsg;
+          finalView = view;
+        }
+        break;
+      }
 
+      let checkFailed = false;
       for (const tc of res.toolCalls) {
         if (!tc.id) tc.id = 'call_' + uid();
         const result = state.stopRequested ? 'Stopped by the user.' : await executeTool(tc, view, runId);
         state.chat.messages.push({ role: 'tool', tool_call_id: tc.id, name: tc.function.name, content: result });
+        if (/^Error/.test(result)) toolErrors++;
+        if (/Automatic check: (Syntax check failed|Page errors|Invalid JSON)/.test(result)) checkFailed = true;
+        if (['web_search', 'fetch_url'].includes(tc.function.name) && !/^Error|^The user denied/.test(result)) usedWeb = true;
       }
       await saveChat();
 
+      if (effort.escalateTo && !escalated) {
+        const reason = checkFailed ? 'a self-check failed'
+          : toolErrors >= 2 ? 'tool calls failed twice'
+            : step + 1 >= ESCALATE_AFTER_STEPS ? 'the task is taking many steps' : null;
+        if (reason) {
+          escalated = true;
+          notice(`Thinking turned on for the rest of this task: ${reason}.`);
+        }
+      }
+
       if (step === effort.maxSteps - 1) {
         notice(`Reached the ${effort.maxSteps}-step limit for ${state.settings.effort} effort. Say "continue" to keep going, or raise the effort.`);
+      }
+    }
+
+    if (finalMsg) {
+      finalView.actions.append(...answerActions(finalMsg));
+      if (usedWeb && state.settings.selfCheck !== false && state.settings.effort !== 'low' && !state.stopRequested) {
+        await sourceCheck(finalMsg, finalView, memory, tools);
       }
     }
   } finally {
@@ -1094,6 +1240,46 @@ async function runAgent() {
     await saveChat();
     setBusy(false);
   }
+}
+
+// ---------- source check ----------
+// A second look at answers built from web pages: list claims the fetched pages don't support.
+// It continues the same conversation, so the engine reuses the cached prompt.
+
+const SOURCE_CHECK_PROMPT = 'Check your last answer against the search results and web pages in the tool results above. '
+  + 'List each factual claim in the answer that those sources do not support, one per line starting with "- ": quote the claim briefly and say what the sources say instead, if anything. '
+  + 'Ignore general knowledge, opinions and code you wrote. If every factual claim is supported, reply exactly: ALL SUPPORTED. Do not call any tools.';
+
+async function sourceCheck(msg, view, memory, tools) {
+  const card = el('div', { class: 'source-check pending', text: 'Checking the answer against its sources…' });
+  view.extra.append(card);
+  scrollToBottom();
+  const scratch = { content: el('div'), meta: el('div'), tools: el('div'), setReasoning() {} };
+  const res = await streamOnce(requestBody([...apiMessages(memory), { role: 'user', content: SOURCE_CHECK_PROMPT }],
+    { maxTokens: 800, tools, effortKey: 'low' }), scratch, { slotOwner: state.chat.id });
+  card.remove();
+  if (!res.ok || res.aborted || !res.content) return;
+  const flagged = res.content.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('- '));
+  msg.sourceCheck = /ALL SUPPORTED/i.test(res.content) && !flagged.length
+    ? { ok: true }
+    : { ok: false, text: flagged.length ? flagged.join('\n') : res.content.trim() };
+  view.extra.append(sourceCheckCard(msg.sourceCheck));
+  scrollToBottom();
+}
+
+function sourceCheckCard(check) {
+  if (check.ok) return el('div', { class: 'source-check ok', text: '✓ Source check: every factual claim is backed by the pages it read.' });
+  const fix = el('button', { class: 'btn small', text: 'Ask it to fix' });
+  fix.addEventListener('click', () => {
+    if (state.busy) return;
+    $('input').value = `A source check flagged claims in your last answer that the pages you read don't support:\n${check.text}\n\nCorrect the answer: back each claim with a source, or drop it.`;
+    send();
+  });
+  return el('details', { class: 'source-check bad', open: '' },
+    el('summary', { text: '⚠ Source check found claims the pages don\'t support' }),
+    el('pre', { text: check.text }),
+    fix,
+  );
 }
 
 function recordUsage(res, view) {
@@ -1194,6 +1380,13 @@ async function executeTool(tc, view, runId) {
     } else if (name === 'fetch_url') {
       result = await api.tools.fetch_url({ url: args.url });
       card.append(el('details', { class: 'tool-body' }, el('summary', { class: 'muted small', text: ` ${fmt(result.length)} chars` }), el('pre', { text: result })));
+    } else if (name === 'search_history') {
+      result = await api.tools.search_history({ query: args.query, excludeChatId: state.chat.id });
+      card.append(el('details', { class: 'tool-body' }, el('summary', { class: 'muted small', text: ' matches' }), el('pre', { text: result })));
+    } else if (name === 'load_skill') {
+      const s = await api.tools.load_skill(String(args.name || '').trim());
+      result = `Skill "${s.name}": ${s.description}\n\n${s.body}`;
+      card.append(el('details', { class: 'tool-body' }, el('summary', { class: 'muted small', text: ' skill' }), el('pre', { text: s.body })));
     }
     stateLabel.textContent = 'done';
     stateLabel.style.color = 'var(--ok)';
@@ -1306,6 +1499,16 @@ function askUser(args, view) {
 
 // ---------- compact ----------
 
+// Plain-text transcript for summaries, with tool output shortened.
+function transcriptOf(messages) {
+  return messages.map((m) => {
+    const body = textOf(m.content);
+    if (m.role === 'tool') return `[tool result] ${body.slice(0, 1500)}`;
+    if (m.tool_calls) return `assistant: ${body}\n[called: ${m.tool_calls.map((t) => `${t.function.name} ${t.function.arguments.slice(0, 300)}`).join('; ')}]`;
+    return `${m.role}: ${body}`;
+  }).join('\n\n');
+}
+
 async function compactCore({ continuing = false, keepLastUser = false } = {}) {
   // When compacting before answering a new message, summarize everything before it and keep it as-is.
   let lastUser = null;
@@ -1313,12 +1516,7 @@ async function compactCore({ continuing = false, keepLastUser = false } = {}) {
     const idx = state.chat.messages.map((m) => m.role === 'user' && !m.hidden).lastIndexOf(true);
     if (idx >= 0) [lastUser] = state.chat.messages.splice(idx, 1);
   }
-  const transcript = apiMessages().slice(1).map((m) => {
-    const body = textOf(m.content);
-    if (m.role === 'tool') return `[tool result] ${body.slice(0, 1500)}`;
-    if (m.tool_calls) return `assistant: ${body}\n[called: ${m.tool_calls.map((t) => `${t.function.name} ${t.function.arguments.slice(0, 300)}`).join('; ')}]`;
-    return `${m.role}: ${body}`;
-  }).join('\n\n');
+  const transcript = transcriptOf(toApiMessages(state.chat.messages));
   const view = assistantView();
   $('messages').append(view.root);
   const res = await streamOnce(requestBody([
@@ -1349,6 +1547,7 @@ async function compact() {
   if (state.busy || !state.chat.messages.length) return;
   setBusy(true);
   try {
+    await stopUpkeep();
     if (!(await ensureModelReady())) return;
     notice('Compacting conversation…');
     await compactCore();
@@ -1365,6 +1564,7 @@ async function runCompare() {
   if (!prompt || state.busy || !keys[0] || !keys[1]) return;
   setBusy(true);
   $('compareRun').disabled = true;
+  await stopUpkeep();
   const previous = state.models.loaded[0];
   const sides = ['A', 'B'];
   try {
@@ -1415,6 +1615,342 @@ async function runCompare() {
     }
     await refreshModels();
     $('compareRun').disabled = false;
+    setBusy(false);
+  }
+}
+
+// ---------- memory upkeep ("sleep") ----------
+// While the app sits idle with a model loaded, summarize finished chats into the journal, then
+// propose tidied-up LOCALPILOT.md notes from the new summaries. Notes change only on approval.
+// Any user request stops the job first; it picks up again at the next idle moment.
+
+const UPKEEP_IDLE_MS = 2 * 60_000;
+const CURRENT_CHAT_QUIET_MS = 10 * 60_000;
+
+const JOURNAL_PROMPT = 'You keep a work journal for a coding assistant. Summarize this chat for future reference as 3-8 short bullet points: '
+  + 'what the user wanted, what was built, changed or decided (with file paths), how it ended, and any lasting facts about the user or project. '
+  + 'Plain facts only, no advice. Under 150 words.';
+
+function consolidationPrompt(project) {
+  return `You maintain LOCALPILOT.md, a short notes file that is loaded into every chat about ${project ? `the project "${project}"` : 'the user and their workspace as a whole'}. Update it from the new session summaries.
+Rules:
+- Keep only lasting facts: goal, stack, how to run, key decisions, conventions, and the user's preferences. Not one-off tasks or chat history.
+- Merge duplicates. Remove notes that the summaries show are outdated. Keep everything else that is still true.
+- Never add facts that are not in the current notes or the summaries.
+- Markdown with short bullet points under a few headings, under 3,000 characters.
+- Reply with the complete new file only: no code fences, no commentary. If nothing lasting is new, reply exactly NO_CHANGES.`;
+}
+
+function upkeepTick(force = false) {
+  if (state.upkeep || state.busy || state.loadingModel || !loadedInfo(state.settings.model)) return;
+  if (!force && Date.now() - state.lastActivity < UPKEEP_IDLE_MS) return;
+  const job = { requestId: null, stopped: false };
+  state.upkeep = job;
+  job.done = runUpkeep(job, force)
+    .catch((err) => setUpkeepStatus(`Memory upkeep failed: ${errText(err)}`))
+    .finally(() => {
+      if (job.stopped) setUpkeepStatus('Paused while you use the model; resumes when idle.');
+      if (state.upkeep === job) state.upkeep = null;
+      renderMemoryBadge();
+      if (!$('memoryModal').classList.contains('hidden')) renderMemoryModal();
+    });
+}
+
+async function stopUpkeep() {
+  const job = state.upkeep;
+  if (!job) return;
+  job.stopped = true;
+  if (job.requestId) api.abort(job.requestId);
+  await job.done;
+}
+
+const setUpkeepStatus = (text) => { $('upkeepStatus').textContent = text; };
+
+// One step per idle tick, so the user never waits long for the model; everything when forced.
+async function runUpkeep(job, force) {
+  do {
+    if (job.stopped) return;
+    const quiet = !state.chat.messages.length || Date.now() - state.chat.updatedAt > CURRENT_CHAT_QUIET_MS;
+    const pending = await api.pendingJournal({ exclude: force || quiet ? null : state.chat.id });
+    if (pending.length) {
+      setUpkeepStatus(`Summarizing chats… ${pending.length} left`);
+      if (!(await summarizeChat(pending[0], job))) return;
+      continue;
+    }
+    setUpkeepStatus('Checking whether the notes need updating…');
+    if (!(await proposeNoteUpdate(job))) break;
+  } while (force);
+  if (!job.stopped) setUpkeepStatus('Up to date.');
+}
+
+// A request that isn't part of any chat. Returns the text, or null if stopped or failed.
+async function backgroundRequest(messages, maxTokens, job) {
+  const scratch = { content: el('div'), meta: el('div'), tools: el('div'), setReasoning() {} };
+  const res = await streamOnce(requestBody(messages, { maxTokens, effortKey: 'low' }), scratch, { job });
+  if (job.stopped || !res.ok || res.aborted || !res.content?.trim()) return null;
+  return res.content.trim();
+}
+
+async function summarizeChat(chatId, job) {
+  const chat = await api.loadChat(chatId);
+  const transcript = transcriptOf(toApiMessages(chat.messages));
+  const summary = await backgroundRequest([
+    { role: 'system', content: JOURNAL_PROMPT },
+    { role: 'user', content: `Chat title: ${chat.title}\n\n${transcript.slice(-20000)}` },
+  ], 600, job);
+  if (!summary) return false;
+  await api.saveJournal({
+    chatId: chat.id,
+    title: chat.title,
+    project: chat.project || null,
+    workspace: chat.workspace || state.settings.workspace,
+    date: chat.updatedAt,
+    chatUpdatedAt: chat.updatedAt,
+    summarizedAt: Date.now(),
+    summary,
+  });
+  return true;
+}
+
+// Propose an update for one notes file with new summaries. Returns false when there was nothing to do.
+async function proposeNoteUpdate(job) {
+  const ws = state.settings.workspace;
+  const [entries, mem, proposals] = await Promise.all([api.listJournal(), api.getMemoryState(), api.listProposals()]);
+  const groups = new Map();
+  for (const e of entries) {
+    const key = e.project || '';
+    if (e.workspace !== ws || e.summarizedAt <= (mem.consolidatedAt?.[`${ws}|${key}`] ?? 0)) continue;
+    if (proposals.some((p) => p.status === 'pending' && p.workspace === ws && (p.project || '') === key)) continue;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(e);
+  }
+  const [key, list] = groups.entries().next().value ?? [];
+  if (!list) return false;
+  let notes;
+  try {
+    notes = await api.getNotes({ project: key || null });
+  } catch {
+    await api.markConsolidated({ key: `${ws}|${key}`, at: Date.now() });  // project folder is gone
+    return true;
+  }
+  const sessions = list.sort((a, b) => a.date - b.date).slice(-12);
+  const reply = await backgroundRequest([
+    { role: 'system', content: consolidationPrompt(key) },
+    {
+      role: 'user',
+      content: `Current ${notes.rel}:\n<<<\n${notes.content.trim() || '(empty: the file does not exist yet)'}\n>>>\n\nNew session summaries:\n\n`
+        + sessions.map((e) => `## ${new Date(e.date).toISOString().slice(0, 10)} · ${e.title}\n${e.summary}`).join('\n\n'),
+    },
+  ], 1500, job);
+  if (!reply) return false;
+  const after = reply.replace(/^```(?:markdown|md)?\n([\s\S]*?)\n```$/, '$1').trim();
+  if (!/^NO_CHANGES\b/.test(after) && after.replace(/\s+/g, ' ') !== notes.content.trim().replace(/\s+/g, ' ')) {
+    await api.addProposal({
+      workspace: ws,
+      project: key || null,
+      rel: notes.rel,
+      existed: notes.exists,
+      before: notes.content,
+      after,
+      sessions: sessions.map((e) => ({ title: e.title, date: e.date })),
+    });
+  }
+  await api.markConsolidated({ key: `${ws}|${key}`, at: Math.max(...list.map((e) => e.summarizedAt)) });
+  return true;
+}
+
+// ---------- memory & skills panel ----------
+
+async function renderMemoryBadge() {
+  const ws = state.settings.workspace;
+  const n = (await api.listProposals()).filter((p) => p.status === 'pending' && p.workspace === ws).length;
+  const badge = $('memoryBadge');
+  badge.textContent = String(n);
+  badge.classList.toggle('hidden', !n);
+  $('memoryBtn').title = n ? `${n} proposed note update${n === 1 ? '' : 's'} waiting for you` : 'Journal, skills and notes the model keeps';
+}
+
+// Line diff (longest common subsequence); notes files are small.
+function lineDiff(a, b) {
+  const x = a ? a.replace(/\n$/, '').split('\n') : [];
+  const y = b ? b.replace(/\n$/, '').split('\n') : [];
+  const dp = Array.from({ length: x.length + 1 }, () => new Array(y.length + 1).fill(0));
+  for (let i = x.length - 1; i >= 0; i--) {
+    for (let j = y.length - 1; j >= 0; j--) dp[i][j] = x[i] === y[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  }
+  const out = [];
+  let i = 0;
+  let j = 0;
+  while (i < x.length || j < y.length) {
+    if (i < x.length && j < y.length && x[i] === y[j]) { out.push(['same', x[i]]); i++; j++; }
+    else if (j < y.length && (i >= x.length || dp[i][j + 1] >= dp[i + 1][j])) out.push(['add', y[j++]]);
+    else out.push(['del', x[i++]]);
+  }
+  return out;
+}
+
+const shortDate = (ts) => new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+
+function proposalView(p) {
+  const diff = el('div', { class: 'diff' }, ...lineDiff(p.before, p.after).map(([kind, line]) =>
+    el('div', { class: `diff-line ${kind}`, text: `${kind === 'add' ? '+' : kind === 'del' ? '−' : ' '} ${line}` })));
+  const editor = el('textarea', { class: 'proposal-edit hidden', rows: '14', 'aria-label': `Edit the proposed ${p.rel}` });
+  editor.value = p.after;
+  const status = el('span', { class: 'small error-text' });
+  const editBtn = el('button', { class: 'btn ghost small', text: 'Edit' });
+  editBtn.addEventListener('click', () => {
+    const editing = editor.classList.toggle('hidden') === false;
+    diff.classList.toggle('hidden', editing);
+    editBtn.textContent = editing ? 'Show changes' : 'Edit';
+  });
+  const resolve = async (action) => {
+    const r = await api.resolveProposal({ id: p.id, action, content: editor.value });
+    if (!r.ok) return (status.textContent = r.error);
+    renderMemoryModal();
+    renderMemoryBadge();
+  };
+  const reject = el('button', { class: 'btn small', text: 'Reject', onclick: () => resolve('reject') });
+  const approve = el('button', { class: 'btn primary small', text: p.existed ? 'Approve' : 'Create file', onclick: () => resolve('apply') });
+  const from = p.sessions.map((s) => `${shortDate(s.date)} ${s.title}`).join(' · ');
+  return el('div', { class: 'proposal' },
+    el('div', { class: 'proposal-head' }, el('code', { text: p.rel }), el('span', { class: 'muted small', text: `from ${p.sessions.length} chat${p.sessions.length === 1 ? '' : 's'}`, title: from })),
+    diff, editor,
+    el('div', { class: 'row' }, status, el('span', { class: 'spacer' }), editBtn, reject, approve),
+  );
+}
+
+function appliedView(p) {
+  const status = el('span', { class: 'small error-text' });
+  const undo = el('button', { class: 'btn ghost small', text: 'Undo' });
+  undo.addEventListener('click', async () => {
+    const r = await api.undoProposal({ id: p.id });
+    if (!r.ok) return (status.textContent = r.error);
+    renderMemoryModal();
+  });
+  return el('div', { class: 'row applied' }, el('span', { class: 'muted small', text: `Updated ${p.rel} on ${shortDate(p.decidedAt)}` }), status, el('span', { class: 'spacer' }), undo);
+}
+
+async function renderMemoryModal() {
+  const ws = state.settings.workspace;
+  const [proposals, journal, pending, examples] = await Promise.all([
+    api.listProposals(), api.listJournal(), api.pendingJournal({}), api.countExamples(),
+  ]);
+  await refreshSkills();
+
+  const box = $('proposalList');
+  box.innerHTML = '';
+  const mine = proposals.filter((p) => p.workspace === ws);
+  const open = mine.filter((p) => p.status === 'pending');
+  if (!open.length) box.append(el('p', { class: 'muted small', text: 'Nothing to review. Proposals appear after chats are summarized.' }));
+  for (const p of open) box.append(proposalView(p));
+  for (const p of mine.filter((x) => x.status === 'applied').slice(-3).reverse()) box.append(appliedView(p));
+
+  const rows = $('skillRows');
+  rows.innerHTML = '';
+  for (const s of state.skills) {
+    const edit = el('button', { class: 'btn small', text: 'Edit' });
+    edit.addEventListener('click', async () => {
+      const full = await api.tools.load_skill(s.name);
+      openSkillEditor({ ...full, previousName: s.name });
+    });
+    const del = el('button', { class: 'btn small', text: 'Delete' });
+    del.addEventListener('click', async () => {
+      if (!confirm(`Delete the skill "${s.name}"?`)) return;
+      await api.deleteSkill(s.name);
+      renderMemoryModal();
+    });
+    rows.append(el('tr', { class: 'skill-row' }, el('td', {}, el('code', { text: s.name })), el('td', { class: 'small', text: s.description }), el('td', { class: 'actions' }, edit, del)));
+  }
+  if (!state.skills.length) rows.append(el('tr', {}, el('td', { colspan: '3', class: 'muted small', text: 'No skills yet. Use "Save as skill" under an answer that went well, or add one.' })));
+
+  const n = journal.length;
+  $('journalStatus').textContent = `${n} chat${n === 1 ? '' : 's'} summarized · ${pending.length} waiting`;
+  const list = $('journalList');
+  list.innerHTML = '';
+  for (const e of journal.slice(0, 8)) {
+    list.append(el('details', { class: 'journal-entry' },
+      el('summary', {}, el('span', { class: 'muted', text: shortDate(e.date) + ' ' }), e.title, e.project ? el('span', { class: 'muted', text: ` · ${e.project}` }) : null),
+      el('div', { class: 'small journal-summary', text: e.summary })));
+  }
+  $('upkeepNowBtn').disabled = !!state.upkeep || !loadedInfo(state.settings.model);
+  if (!state.upkeep && !$('upkeepStatus').textContent) {
+    setUpkeepStatus(loadedInfo(state.settings.model) ? 'Runs after 2 minutes idle.' : 'Load a model to let upkeep run.');
+  }
+  $('exampleCount').textContent = `${examples} rated answer${examples === 1 ? '' : 's'} saved.`;
+}
+
+// ---------- skills ----------
+
+async function refreshSkills() {
+  try {
+    state.skills = await api.listSkills();
+  } catch {
+    state.skills = [];
+  }
+}
+
+function openSkillEditor({ name = '', description = '', body = '', previousName = null } = {}) {
+  state.skillEditing = previousName;
+  $('skillName').value = name;
+  $('skillDesc').value = description;
+  $('skillBody').value = body;
+  $('skillStatus').textContent = '';
+  $('skillStatus').classList.remove('error-text');
+  openModal('skillModal');
+}
+
+async function saveSkillFromEditor() {
+  const status = $('skillStatus');
+  try {
+    await api.saveSkill({
+      name: $('skillName').value.trim(),
+      description: $('skillDesc').value.trim(),
+      body: $('skillBody').value,
+      previousName: state.skillEditing,
+    });
+  } catch (err) {
+    status.textContent = errText(err);
+    status.classList.add('error-text');
+    return;
+  }
+  $('skillModal').classList.add('hidden');
+  await refreshSkills();
+  if (!$('memoryModal').classList.contains('hidden')) renderMemoryModal();
+  notice(`Saved the skill "${$('skillName').value.trim()}". The model can load it from now on.`);
+}
+
+const SKILL_DRAFT_PROMPT = 'You turn a task that went well in a coding assistant\'s chat into a reusable skill: instructions the same assistant can follow the next time a similar task comes up. '
+  + 'Reply in exactly this format:\nname: short-kebab-case-name\ndescription: one line saying when to use this skill\n---\n'
+  + 'Then: the steps that worked, as a numbered list; pitfalls to avoid (from any mistakes in the transcript); and a short worked example (the key command or code) taken from the transcript. '
+  + 'Generalize: leave out one-off file names and details. Under 350 words.';
+
+async function draftSkill(msg) {
+  if (state.busy) return;
+  const idx = state.chat.messages.indexOf(msg);
+  const start = state.chat.messages.map((m, i) => i <= idx && m.role === 'user' && !m.hidden).lastIndexOf(true);
+  const transcript = transcriptOf(toApiMessages(state.chat.messages.slice(Math.max(0, start), idx + 1)));
+  openSkillEditor();
+  $('skillStatus').textContent = 'Drafting with the model…';
+  setBusy(true);
+  try {
+    await stopUpkeep();
+    if (!(await ensureModelReady())) return;
+    const scratch = { content: el('div'), meta: el('div'), tools: el('div'), setReasoning() {} };
+    const res = await streamOnce(requestBody([
+      { role: 'system', content: SKILL_DRAFT_PROMPT },
+      { role: 'user', content: transcript.slice(-20000) },
+    ], { maxTokens: 1000, effortKey: 'low' }), scratch);
+    if (!res.ok || !res.content) {
+      $('skillStatus').textContent = res.error || 'The model returned nothing. Write the skill by hand, or try again.';
+      return;
+    }
+    const text = res.content.trim();
+    const sep = text.indexOf('\n---');
+    $('skillName').value = (text.match(/^name:\s*(.+)$/m)?.[1] || '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+    $('skillDesc').value = text.match(/^description:\s*(.+)$/m)?.[1]?.trim() || '';
+    $('skillBody').value = sep >= 0 ? text.slice(sep + 4).trim() : text.replace(/^(name|description):.*$/gm, '').trim();
+    $('skillStatus').textContent = 'Draft ready. Edit anything, then save.';
+  } finally {
     setBusy(false);
   }
 }
@@ -1544,6 +2080,18 @@ async function init() {
   $('addPromptBtn').addEventListener('click', addPrompt);
   $('newPromptText').addEventListener('keydown', (e) => { if (e.key === 'Enter') addPrompt(); });
   $('compareRun').addEventListener('click', runCompare);
+
+  $('memoryBtn').addEventListener('click', () => { openModal('memoryModal'); renderMemoryModal(); });
+  $('upkeepNowBtn').addEventListener('click', () => { upkeepTick(true); renderMemoryModal(); });
+  $('newSkillBtn').addEventListener('click', () => openSkillEditor());
+  $('revealSkillsBtn').addEventListener('click', () => api.revealSkills());
+  $('revealExamplesBtn').addEventListener('click', () => api.revealExamples());
+  $('skillSave').addEventListener('click', saveSkillFromEditor);
+  // Memory upkeep waits until the user has left the app alone for a while.
+  ['keydown', 'mousedown', 'wheel'].forEach((ev) => document.addEventListener(ev, () => { state.lastActivity = Date.now(); }, { capture: true, passive: true }));
+  setInterval(() => upkeepTick(), 30_000);
+  await refreshSkills();
+  renderMemoryBadge();
 
   startNewChat();
   await api.ensureServer();

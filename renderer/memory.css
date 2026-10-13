@@ -1,0 +1,59 @@
+/* Memory layer UI: answer actions, source check, Memory & skills panel, skill editor.
+   Uses only the shared color variables from styles.css. */
+
+.spacer { flex: 1; }
+
+/* sidebar badge */
+#memoryBtn { display: inline-flex; align-items: center; gap: 6px; }
+.badge {
+  min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; font-size: 11px; line-height: 18px;
+  text-align: center; background: var(--accent); color: var(--paper, #fff); font-weight: 600;
+}
+
+/* under each final answer */
+.msg .footer { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.msg .footer .meta { margin-top: 0; }
+.answer-actions { display: inline-flex; gap: 6px; align-items: center; margin-left: auto; opacity: .55; transition: opacity .15s; }
+.msg:hover .answer-actions, .answer-actions:focus-within { opacity: 1; }
+.rate-btn {
+  border: 1px solid var(--border); background: transparent; border-radius: var(--radius); padding: 2px 8px; font-size: 13px;
+  filter: grayscale(1);
+}
+.rate-btn:hover { border-color: var(--accent); }
+.rate-btn.on { filter: none; border-color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+
+/* source check */
+.source-check { margin: 8px 0; padding: 8px 12px; border-radius: var(--radius); font-size: 12.5px; border: 1px solid var(--border); }
+.source-check.pending { color: var(--muted); border-style: dashed; }
+.source-check.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+.source-check.bad { border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
+.source-check.bad summary { color: var(--warn); cursor: pointer; }
+.source-check pre { white-space: pre-wrap; font-size: 12px; margin: 8px 0; color: var(--text); }
+
+/* proposals */
+.proposal { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 12px; background: rgba(255, 255, 255, 0.45); }
+.proposal-head { display: flex; gap: 10px; align-items: baseline; margin-bottom: 8px; }
+.proposal .row { margin-top: 8px; }
+.diff {
+  max-height: 320px; overflow: auto; background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 6px 0; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+}
+.diff-line { white-space: pre-wrap; padding: 0 10px; }
+.diff-line.same { color: var(--muted); }
+.diff-line.add { color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.diff-line.del { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); text-decoration: line-through; }
+.proposal-edit, #skillBody {
+  width: 100%; background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px;
+  font-family: ui-monospace, Menlo, monospace; font-size: 12px; resize: vertical;
+}
+.row.applied { padding: 4px 2px; }
+
+/* journal */
+.journal-entry { padding: 6px 2px; border-top: 1px solid var(--border); font-size: 13px; }
+.journal-entry summary { cursor: pointer; font-family: var(--serif, inherit); font-size: 15px; }
+.journal-summary { white-space: pre-wrap; color: var(--muted); padding: 6px 0 2px 14px; }
+
+/* skill editor */
+.skill-form { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.skill-form label { margin-top: 6px; }
+.skill-form .row { margin-top: 8px; }
