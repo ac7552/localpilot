@@ -83,6 +83,26 @@ test('Chat mode sends no tools', () => withApp({ settings: { mode: 'chat' } }, [
   assert.equal(app.text(app.lastAnswer().querySelector('.content')), 'A TCP handshake is SYN, SYN-ACK, ACK.');
 }));
 
+test('Chat mode flags an answer that claims it created files', () => withApp({ settings: { mode: 'chat' } }, [
+  { content: 'I\'ve created the file audit.py for you. The files are located at /tmp/audit.py.' },
+], async (app) => {
+  await app.send('Write me a security audit script and save it');
+  const banner = app.lastAnswer().querySelector('.banner.grounding');
+  assert(banner, 'a grounding warning is shown');
+  assert.match(banner.textContent, /Nothing was created or run/);
+  // The next turn is told the claim was false, so a small model stops doubling down.
+  const note = app.ev("state.chat.messages.filter((m) => m.role === 'user' && m.hidden).at(-1)?.content");
+  assert.match(note, /no file or command tools in Chat mode/);
+}));
+
+test('a real file write is not flagged as confabulation', () => withApp({}, [
+  { tools: [call('write_file', { path: 'r/real.py', content: 'print("real")\n' })] },
+  { content: 'I\'ve created r/real.py for you.' },
+], async (app) => {
+  await app.send('Make a real script');
+  assert(!app.lastAnswer().querySelector('.banner.grounding'), 'no grounding warning when a file really was written');
+}));
+
 test('paths outside the workspace come back to the model as errors', () => withApp({}, [
   { tools: [call('write_file', { path: '../escape.txt', content: 'x' }), call('read_file', { path: '/etc/hosts' })] },
   { content: 'I can only work inside the workspace.' },

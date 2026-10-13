@@ -690,6 +690,7 @@ function renderConversation() {
         }
         if (m.meta) currentAssistant.meta.textContent = m.meta;
         if (m.content && !m.tool_calls?.length) currentAssistant.actions.append(...answerActions(m));
+        if (m.grounding) currentAssistant.extra.append(groundingCard(m.grounding));
         if (m.sourceCheck) currentAssistant.extra.append(sourceCheckCard(m.sourceCheck));
       } else if (m.role === 'notice') {
         box.append(el('div', { class: 'notice', text: m.content }));
@@ -899,10 +900,14 @@ function systemPrompt(memory = {}) {
     `The user's workspace folder is ${state.settings.workspace}. All file paths you use are relative to it.`,
   ];
   if (mode === 'chat') {
-    lines.push('Tools are disabled in this mode. Answer in chat. When asked to build something, give complete, runnable files in code blocks with the filename above each one, not a list of steps.');
+    lines.push(
+      'Tools are disabled in this mode. Answer in chat. When asked to build something, give complete, runnable files in code blocks with the filename above each one, not a list of steps.',
+      'You have NO ability to create, save, read, or run files, or to run commands, in this mode. Never claim you did any of those: do not say you created or saved a file, do not give a path as if a file exists there, and do not report command or test output as if you actually ran it. If the task needs real files or commands, say plainly that you can\'t do it in Chat mode and tell the user to switch to Auto or Manual.',
+    );
   } else {
     lines.push(
       'You can act, not just describe. Use write_file to create files, edit_file to change existing files, search_files and read_file to find and read code, run_command to run things, and open_file to show results.',
+      'Only claim you did something after the tool for it actually ran and succeeded. Never say you created or saved a file, or report command or test output, unless it came from a real write_file / edit_file / run_command result in this conversation. If you haven\'t run it yet, say what you are about to do, then do it with a tool.',
       'When asked to build something, BUILD it. Do not list steps for the user to do themselves.',
       'Prefer edit_file over rewriting whole files. Use search_files to locate code instead of reading many files.',
       'Put each new project in its own subfolder unless the user says otherwise.',
@@ -1240,6 +1245,7 @@ async function runAgent() {
     run = startRun();
     let escalated = false;
     let toolErrors = 0;
+    let actionsRun = 0;  // file/command tools that actually ran, for the grounding check
     let usedWeb = false;
     let finalMsg = null;
     let finalView = null;
@@ -1294,6 +1300,7 @@ async function runAgent() {
         const result = state.stopRequested ? 'Stopped by the user.' : await executeTool(tc, view, runId);
         state.chat.messages.push({ role: 'tool', tool_call_id: tc.id, name: tc.function.name, content: result });
         if (/^Error/.test(result)) toolErrors++;
+        if (ACTION_TOOLS.has(tc.function.name) && !/^Error|^The user denied|^Stopped/.test(result)) actionsRun++;
         if (/Automatic check: (Syntax check failed|Page errors|Invalid JSON)/.test(result)) checkFailed = true;
         if (['web_search', 'fetch_url'].includes(tc.function.name) && !/^Error|^The user denied/.test(result)) usedWeb = true;
       }
@@ -1317,6 +1324,7 @@ async function runAgent() {
 
     if (finalMsg) {
       finalView.actions.append(...answerActions(finalMsg));
+      groundingCheck(finalMsg, finalView, actionsRun);
       if (usedWeb && state.settings.selfCheck !== false && state.settings.effort !== 'low' && !state.stopRequested) {
         await sourceCheck(finalMsg, finalView, memory, tools);
       }
@@ -1376,6 +1384,52 @@ function sourceCheckCard(check) {
     el('pre', { text: check.text }),
     fix,
   );
+}
+
+// ---------- grounding check ----------
+// Catch confabulation early: an answer that claims it created/ran something when no file or
+// command tool actually ran this turn. The app knows the ground truth (what executed), so it
+// flags the gap instead of trusting the prose. In Chat mode nothing can run, so any such claim
+// is necessarily false; we also tell the next turn so a small model stops doubling down.
+
+const ACTION_TOOLS = new Set(['write_file', 'edit_file', 'run_command']);
+const ACTION_CLAIM = new RegExp(
+  '(\\bI(?:\'ve| have)?\\s+(?:created|wrote|written|saved|added|generated|updated|edited|modified|deleted|removed|ran|executed|installed|built|set up)\\b'
+  + '|\\b(?:created|saved|wrote|added) (?:the|a|them|it|both) (?:file|files|script|scripts)?'
+  + '|\\bthe files? (?:are|is) (?:now )?(?:located|saved|created|at|in)\\b'
+  + '|\\bhere (?:are|is) the (?:results?|output)\\b'
+  + '|\\bthe (?:output|results?) (?:of|were|was|show|are)\\b'
+  + '|\\brunning (?:the |it )?(?:script|command|test)s? (?:gave|produced|returned|shows?|showed))',
+  'i',
+);
+
+function claimsAction(text) {
+  return !!text && ACTION_CLAIM.test(text);
+}
+
+// Attached after a run, given how many action tools actually ran in it.
+function groundingCheck(msg, view, actionsRun) {
+  if (actionsRun > 0) return;              // it really did something this turn — claims are fine
+  if (!claimsAction(msg.content)) return;  // the answer doesn't claim any action
+  const chatMode = state.settings.mode === 'chat';
+  msg.grounding = { chatMode };
+  view.extra.append(groundingCard(msg.grounding));
+  if (chatMode) {
+    // Unambiguous: no tools exist, so the claim can't be true. Scope the note to the last turn
+    // so it never discourages referring back to real work from earlier turns in tool modes.
+    state.chat.messages.push({
+      role: 'user', hidden: true,
+      content: '[Note from the app: you have no file or command tools in Chat mode, so nothing in your last answer was actually created, saved, or run, and any paths or output you gave are not real. Do not claim otherwise. If the task needs real files or commands, tell the user to switch to Auto or Manual mode.]',
+    });
+  }
+  scrollToBottom();
+}
+
+function groundingCard(g) {
+  const text = g.chatMode
+    ? '⚠ Nothing was created or run. Tools are off in Chat mode, so any files, paths, or results in this answer don\'t exist. Switch to Auto or Manual to let it actually build and run things.'
+    : '⚠ No files changed and no commands ran this turn. If the answer says it created, saved, or ran something, that didn\'t actually happen.';
+  return el('div', { class: 'banner grounding', text });
 }
 
 function recordUsage(res, view) {
