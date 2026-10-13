@@ -1,0 +1,54 @@
+/* Connect panel and the remote-model status. Uses only the shared color variables from styles.css,
+   so it follows the light and dark themes. */
+
+.connect-card { width: min(760px, 94vw); max-height: 88vh; overflow-y: auto; }
+.connect-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.connect-section h3 { margin: 0 0 6px; font-size: 14px; }
+.connect-section p { margin: 4px 0; }
+.connect-section .row { margin-top: 8px; }
+.connect-me { margin-top: 10px; }
+.connect-me input[type=text] { max-width: 260px; }
+.connect-options { gap: 14px; }
+.connect-options .num { width: 64px; margin: 0 4px; }
+.connect-error { color: var(--danger); font-size: 12px; margin: 4px 0 0; }
+.connect-error:empty { display: none; }
+.connect-trust { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--border); }
+.ok-text { color: var(--ok); }
+.warn-text { color: var(--warn); }
+.danger-text { color: var(--danger); }
+
+/* on/off switch */
+.switch {
+  width: 40px; height: 22px; border-radius: 11px; border: 1px solid var(--border-strong, var(--border));
+  background: color-mix(in srgb, var(--text) 12%, transparent); position: relative; flex: none; padding: 0; cursor: pointer;
+}
+.switch::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--muted); transition: left .15s var(--ease, ease), background .15s;
+}
+.switch.on { background: color-mix(in srgb, var(--ok) 35%, transparent); border-color: var(--ok); }
+.switch.on::after { left: 20px; background: var(--ok); }
+
+/* machines */
+.clist { display: flex; flex-direction: column; margin-top: 6px; }
+.crow { display: flex; align-items: center; gap: 10px; padding: 8px 2px; border-top: 1px solid var(--border); }
+.crow:first-child { border-top: 0; }
+.crow.check { cursor: pointer; }
+.cmain { flex: 1; min-width: 0; }
+.cmain .small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cdot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--muted); opacity: .5; display: inline-block; }
+.cdot.on { background: var(--ok); opacity: 1; }
+.cdot.warn { background: var(--warn); opacity: 1; }
+.cgroup { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; margin-top: 10px; }
+.pair-form { padding: 4px 0 8px 18px; }
+
+/* codes */
+.pair-code { font-size: 13px; margin-top: 10px !important; }
+.pair-code .code, .code-input { font-family: var(--mono, ui-monospace, Menlo, monospace); letter-spacing: .08em; }
+.pair-code .code { font-size: 15px; color: var(--text); }
+
+/* sidebar badge: a join request waiting stands out */
+.badge.attention { background: var(--warn); }
+
+/* model status while prompts go to another machine */
+.pill.remote { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }

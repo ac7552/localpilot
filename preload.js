@@ -74,4 +74,22 @@ contextBridge.exposeInMainWorld('localpilot', {
   countExamples: invoke('examples:count'),
   revealExamples: invoke('examples:reveal'),
   onCommandOutput: (h) => subscribe('tool:commandOutput', h),
+
+  // Connect: sharing with other machines, on this network or in a group through the relay.
+  network: {
+    state: invoke('network:state'),
+    setShare: invoke('network:setShare'),
+    newCode: invoke('network:newCode'),
+    pair: invoke('network:pair'),
+    unpair: invoke('network:unpair'),
+    rename: invoke('network:rename'),
+    setRelay: invoke('network:setRelay'),
+    group: invoke('network:group'),
+    poolEstimate: invoke('network:poolEstimate'),
+    loadPool: invoke('network:loadPool'),
+    setBackground: invoke('network:setBackground'),
+    setBusy: invoke('network:setBusy'),
+    onState: (h) => subscribe('network:state', h),
+    onServed: (h) => subscribe('network:served', h),
+  },
 });

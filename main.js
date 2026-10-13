@@ -1,13 +1,14 @@
 // LocalPilot main process: owns everything with real power (LM Studio, files, shell).
 // The renderer only asks for things over IPC; workspace confinement is enforced here.
 
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } = require('electron');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const os = require('os');
+const { NetworkManager } = require('./network/manager');
 
 const LMS = path.join(os.homedir(), '.lmstudio', 'bin', 'lms');
 const LMS_MODELS = path.join(os.homedir(), '.lmstudio', 'models');
@@ -16,10 +17,14 @@ const API = 'http://localhost:1234/v1';
 // LocalPilot's own engine: a local llama.cpp build (~/llama.cpp) patched to run
 // Qwen3.5/3.6 on this Mac's GPU, which LM Studio's bundled llama.cpp crashes on.
 const LLAMA_SERVER = path.join(os.homedir(), 'llama.cpp', 'build', 'bin', 'llama-server');
+// The same llama.cpp built with RPC (cmake -DGGML_RPC=ON -B build-rpc): it splits a pooled model
+// across machines, and its worker serves this Mac's memory to others.
+const LLAMA_RPC_BIN = path.join(os.homedir(), 'llama.cpp', 'build-rpc', 'bin');
 const ENGINE_PORT = 55991;
 const ENGINE_API = `http://127.0.0.1:${ENGINE_PORT}/v1`;
 const AUTO_ENGINE_ARCH = /^qwen3(5|6)/;
-let engine = null;  // { child, modelKey, displayName, contextLength, ready }
+let engine = null;  // { child, modelKey, displayName, contextLength, ready, pooled? }
+let network = null; // Connect: other machines (network/manager.js)
 const MAX_TOOL_OUTPUT = 12000;
 const MAX_READ_BYTES = 200_000;
 
@@ -143,6 +148,7 @@ function createWindow() {
 app.whenReady().then(() => {
   killOrphanEngines();
   createWindow();
+  startNetwork();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 app.on('window-all-closed', () => app.quit());
@@ -154,7 +160,7 @@ app.on('before-quit', (e) => {
   e.preventDefault();
   const save = engine?.slotOwner ? saveSlot(engine.slotOwner) : Promise.resolve();
   Promise.race([save, new Promise((r) => setTimeout(r, 10_000))])
-    .finally(() => stopEngine().finally(() => app.quit()));
+    .finally(() => Promise.resolve(network?.stop()).catch(() => {}).finally(() => stopEngine().finally(() => app.quit())));
 });
 process.on('exit', () => { try { engine?.child.kill('SIGKILL'); } catch { /* already gone */ } });
 
@@ -248,13 +254,63 @@ function engineFor(model) {
 
 async function listDownloaded() {
   const ls = await runLms(['ls', '--json'], { timeoutMs: 30_000 });
-  return parseJson(ls.out, []).filter((m) => m.type === 'llm');
+  downloadedCache = parseJson(ls.out, []).filter((m) => m.type === 'llm');
+  return downloadedCache;
+}
+
+let downloadedCache = [];  // last `lms ls`, for model details without asking LM Studio again
+let lmsLoaded = [];        // last `lms ps`: models LM Studio has loaded
+
+async function refreshLmsLoaded() {
+  const ps = await runLms(['ps', '--json'], { timeoutMs: 30_000 });
+  lmsLoaded = parseJson(ps.out, []).filter((m) => m.type === 'llm').map((m) => ({ ...m, engine: 'lmstudio' }));
+  network?.localModelsChanged();
+}
+
+// The models this Mac can answer with for other machines: whatever is loaded, except a pooled
+// model (it already borrows other machines' memory).
+function servableModels() {
+  const details = (key) => downloadedCache.find((m) => m.modelKey === key) ?? {};
+  const out = [];
+  if (engine?.ready && !engine.pooled) {
+    out.push({ key: engine.modelKey, name: engine.displayName, ctx: engine.contextLength, vision: engine.vision, arch: engine.architecture });
+  }
+  for (const m of lmsLoaded) {
+    if (out.some((x) => x.key === m.modelKey)) continue;
+    const d = details(m.modelKey);
+    out.push({ key: m.modelKey, name: m.displayName || d.displayName || m.modelKey, ctx: m.contextLength || 0, vision: !!(m.vision ?? d.vision), arch: d.architecture || '' });
+  }
+  return out;
+}
+
+// GPU memory on this Mac, as llama.cpp sees it (it's what splits a pooled model).
+async function memoryInfo() {
+  const bin = rpcEngineAvailable() ? path.join(LLAMA_RPC_BIN, 'llama-server') : LLAMA_SERVER;
+  if (!fs.existsSync(bin)) return null;
+  const out = await new Promise((resolve) => {
+    let text = '';
+    const child = spawn(bin, ['--list-devices']);
+    child.stdout.on('data', (b) => { text += b; });
+    child.stderr.on('data', (b) => { text += b; });
+    child.on('close', () => resolve(text));
+    child.on('error', () => resolve(''));
+    setTimeout(() => { try { child.kill(); } catch { /* done */ } }, 15_000);
+  });
+  const m = out.match(/^\s*(MTL\d|CUDA\d|Vulkan\d)[^(]*\((\d+) MiB, (\d+) MiB free\)/m);
+  return m ? { device: m[1], totalMiB: Number(m[2]), freeMiB: Number(m[3]) } : null;
+}
+
+function rpcServerPath() {
+  const bin = path.join(LLAMA_RPC_BIN, 'ggml-rpc-server');
+  return fs.existsSync(bin) ? bin : null;
 }
 
 function stopEngine() {
   if (!engine) return Promise.resolve();
-  const { child } = engine;
+  const { child, pooled } = engine;
   engine = null;
+  if (pooled) network?.stopPool();
+  network?.localModelsChanged();
   return new Promise((resolve) => {
     if (child.exitCode !== null) return resolve();
     child.once('exit', () => resolve());
@@ -268,9 +324,14 @@ function stopEngine() {
 function killOrphanEngines() {
   const { spawnSync } = require('child_process');
   spawnSync('/usr/bin/pkill', ['-f', `${LLAMA_SERVER} .*--port ${ENGINE_PORT}`]);
+  spawnSync('/usr/bin/pkill', ['-f', `${path.join(LLAMA_RPC_BIN, 'llama-server')} .*--port ${ENGINE_PORT}`]);
 }
 
-function startEngine(model, contextLength) {
+const rpcEngineAvailable = () => fs.existsSync(path.join(LLAMA_RPC_BIN, 'llama-server'));
+
+// pool: { rpc: ['127.0.0.1:port', …], split: [MiB here, MiB on each machine…], peers: [names] }
+// to split the model across machines (network/manager.js tunnels each address to one of them).
+function startEngine(model, contextLength, pool = null) {
   return new Promise((resolve) => {
     const args = [
       '-m', path.join(LMS_MODELS, model.path),
@@ -287,12 +348,19 @@ function startEngine(model, contextLength) {
     // Speed: a multi-token-prediction draft model, measured ~30% faster for Gemma 4 on this Mac.
     const MTP_DRAFTS = { gemma4: path.join(os.homedir(), 'models', 'mtp-gemma-4-12B-it.gguf') };
     const draft = MTP_DRAFTS[model.architecture];
-    const hasDraft = !!draft && fs.existsSync(draft);
+    const hasDraft = !pool && !!draft && fs.existsSync(draft);
     if (hasDraft) args.push('-md', draft, '--spec-type', 'draft-mtp');
+    // A pooled model: this Mac's GPU plus one RPC device per machine, each given its share.
+    if (pool) {
+      args.push('--rpc', pool.rpc.join(','));
+      args.push('-dev', ['MTL0', ...pool.rpc.map((_, i) => `RPC${i}`)].join(','));
+      args.push('-ts', pool.split.map((n) => Math.max(1, Math.round(n))).join(','));
+    }
     // Keep at most 2 GiB of recent prompt states in RAM (the 8 GiB default is half this Mac),
-    // and let each chat's cache be saved to disk. Slot files don't cover a draft model's state.
+    // and let each chat's cache be saved to disk. Slot files don't cover a draft model's state,
+    // and aren't used for pooled models, whose state lives partly on other machines.
     args.push('--cache-ram', '2048');
-    if (!hasDraft) {
+    if (!hasDraft && !pool) {
       fs.mkdirSync(kvDir(), { recursive: true });
       args.push('--slot-save-path', kvDir());
     }
@@ -302,7 +370,7 @@ function startEngine(model, contextLength) {
       const mmproj = fs.readdirSync(dir).find((f) => /^mmproj.*\.gguf$/i.test(f) || /\.mmproj-.*\.gguf$/i.test(f));
       if (mmproj && model.vision) args.push('--mmproj', path.join(dir, mmproj));
     } catch { /* no projector */ }
-    const child = spawn(LLAMA_SERVER, args, { env: process.env });
+    const child = spawn(pool ? path.join(LLAMA_RPC_BIN, 'llama-server') : LLAMA_SERVER, args, { env: process.env });
     let log = '';
     let settled = false;
     const finish = (result) => { if (!settled) { settled = true; resolve(result); } };
@@ -315,19 +383,26 @@ function startEngine(model, contextLength) {
         engine.ready = true;
         send('models:loadProgress', { modelKey: model.modelKey, percent: 100 });
         finish({ ok: true });
+        network?.localModelsChanged();
       }
     };
     child.stdout.on('data', onData);
     child.stderr.on('data', onData);
     child.on('exit', (code, signal) => {
-      if (engine?.child === child) engine = null;
+      if (engine?.child === child) {
+        engine = null;
+        if (pool) network?.stopPool();
+        network?.localModelsChanged();
+      }
       const reason = log.split('\n').reverse().find((l) => /GGML_ASSERT|GGML_ABORT|error|failed/i.test(l)) || `exit ${code ?? signal}`;
       finish({ ok: false, error: `Engine stopped while loading (${signal ?? code}): ${reason.trim()}` });
     });
     child.on('error', (err) => finish({ ok: false, error: `Could not start engine: ${err.message}` }));
     engine = {
       child, modelKey: model.modelKey, displayName: model.displayName, contextLength, ready: false,
-      slotSave: !hasDraft, slotOwner: null,  // slotOwner: the chat whose prompt is in the cache now
+      slotSave: !hasDraft && !pool, slotOwner: null,  // slotOwner: the chat whose prompt is in the cache now
+      pooled: pool ? pool.peers : null,
+      architecture: model.architecture, vision: !!model.vision,
     };
     setTimeout(() => {
       if (!settled) {
@@ -345,10 +420,11 @@ ipcMain.handle('models:list', async () => {
   ]);
   for (const m of downloaded) m.engine = engineFor(m);
   const loaded = parseJson(ps.out, []).filter((m) => m.type === 'llm').map((m) => ({ ...m, engine: 'lmstudio' }));
+  lmsLoaded = loaded;
   if (engine?.ready) {
-    loaded.push({ modelKey: engine.modelKey, displayName: engine.displayName, contextLength: engine.contextLength, engine: 'llamacpp' });
+    loaded.push({ modelKey: engine.modelKey, displayName: engine.displayName, contextLength: engine.contextLength, engine: 'llamacpp', pooled: engine.pooled });
   }
-  return { downloaded, loaded, engineAvailable: engineAvailable() };
+  return { downloaded, loaded, remote: network?.remoteModels() ?? [], engineAvailable: engineAvailable(), rpcAvailable: rpcEngineAvailable() };
 });
 
 ipcMain.handle('models:estimate', async (_e, { modelKey, contextLength }) => {
@@ -357,6 +433,21 @@ ipcMain.handle('models:estimate', async (_e, { modelKey, contextLength }) => {
   const gib = text.match(/Estimated Total Memory:\s*([\d.]+)\s*GiB/i);
   return { totalGiB: gib ? Number(gib[1]) : null, willFail: /will fail to load/i.test(text), raw: text.trim() };
 });
+
+// Split one model across this Mac and other machines' memory (called by network/manager.js).
+async function startPooledModel({ modelKey, contextLength, rpc, split, peers }) {
+  if (!rpcEngineAvailable()) {
+    return { ok: false, error: 'Pooled models need llama.cpp built with RPC: cmake -S ~/llama.cpp -B ~/llama.cpp/build-rpc -DGGML_RPC=ON, then build llama-server and ggml-rpc-server.' };
+  }
+  if (engine?.slotOwner) await saveSlot(engine.slotOwner);
+  await stopEngine();
+  killOrphanEngines();
+  await runLms(['unload', '--all'], { timeoutMs: 60_000 });
+  refreshLmsLoaded().catch(() => {});
+  const model = (await listDownloaded()).find((m) => m.modelKey === modelKey);
+  if (!model) return { ok: false, error: 'That model isn\'t downloaded on this Mac.' };
+  return startEngine(model, contextLength, { rpc, split, peers });
+}
 
 ipcMain.handle('models:load', async (_e, { modelKey, contextLength }) => {
   // Only one model fits in GPU memory at a time, whichever engine runs it.
@@ -376,6 +467,7 @@ ipcMain.handle('models:load', async (_e, { modelKey, contextLength }) => {
     },
   });
   const errorLine = (r.out + '\n' + r.err).split('\n').find((l) => /^Error/i.test(l.trim()));
+  refreshLmsLoaded().catch(() => {});
   return { ok: r.code === 0 && !errorLine, error: errorLine || (r.code !== 0 ? (r.err || r.out).trim().slice(-600) : null) };
 });
 
@@ -391,6 +483,7 @@ ipcMain.handle('models:setEngine', (_e, { modelKey, engine: choice }) => {
 ipcMain.handle('models:unload', async () => {
   await stopEngine();
   const r = await runLms(['unload', '--all'], { timeoutMs: 60_000 });
+  refreshLmsLoaded().catch(() => {});
   return { ok: r.code === 0 };
 });
 
@@ -407,6 +500,24 @@ ipcMain.handle('models:download', async (_e, { query, requestId }) => {
 ipcMain.handle('chat:stream', async (_e, { requestId, body, slotOwner = null }) => {
   const controller = new AbortController();
   streams.set(requestId, controller);
+  const onChunk = (chunk) => send('chat:chunk', { requestId, chunk });
+  try {
+    if (NetworkManager.isRemoteKey(body.model)) {
+      if (!network) return { ok: false, error: 'Connect isn\'t running.' };
+      return await network.streamRemote({
+        body, slotOwner, signal: controller.signal, onChunk,
+        onServed: (who) => send('network:served', { requestId, slotOwner, ...who }),
+      });
+    }
+    return await streamCompletion({ body, slotOwner, signal: controller.signal, onChunk });
+  } finally {
+    streams.delete(requestId);
+  }
+});
+
+// Stream a chat completion from the LocalPilot engine or LM Studio, handing each parsed chunk to
+// onChunk. Used for this Mac's own chats and for requests from other machines (Connect).
+async function streamCompletion({ body, slotOwner = null, signal, onChunk }) {
   const onEngine = engine?.ready && engine.modelKey === body.model;
   if (onEngine) await prepareSlot(slotOwner ? safeChatId(slotOwner) : null);
   const base = onEngine ? ENGINE_API : API;
@@ -421,7 +532,7 @@ ipcMain.handle('chat:stream', async (_e, { requestId, body, slotOwner = null }) 
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      signal: controller.signal,
+      signal,
     });
     if (!res.ok) {
       const text = await res.text();
@@ -450,7 +561,7 @@ ipcMain.handle('chat:stream', async (_e, { requestId, body, slotOwner = null }) 
           streamError = typeof parsed.error === 'string' ? parsed.error : (parsed.error.message || JSON.stringify(parsed.error));
           continue;
         }
-        send('chat:chunk', { requestId, chunk: parsed });
+        onChunk(parsed);
       }
     }
     if (streamError) {
@@ -466,10 +577,61 @@ ipcMain.handle('chat:stream', async (_e, { requestId, body, slotOwner = null }) 
   } catch (err) {
     if (err.name === 'AbortError') return { ok: true, aborted: true };
     return { ok: false, error: `Could not reach ${onEngine ? 'the LocalPilot engine' : 'LM Studio'} at ${base}: ${err.message}` };
-  } finally {
-    streams.delete(requestId);
   }
-});
+}
+
+// ---------- IPC: Connect (other machines) ----------
+
+function startNetwork() {
+  try {
+    network = new NetworkManager({
+      dataDir: dataDir(),
+      readSettings,
+      writeSettings,
+      secure: {
+        available: () => safeStorage.isEncryptionAvailable(),
+        encrypt: (s) => safeStorage.encryptString(s),
+        decrypt: (b) => safeStorage.decryptString(b),
+      },
+      local: { servableModels, streamCompletion, memoryInfo, rpcServerPath, startPool: startPooledModel },
+    });
+    network.on('state', (s) => send('network:state', { ...s, remoteModels: network.remoteModels() }));
+    network.start();
+    listDownloaded().then(refreshLmsLoaded).catch(() => {});
+  } catch (err) {
+    console.error('Connect failed to start:', err);
+    network = null;
+  }
+}
+
+// Each handler answers { ok, ...result } or { ok: false, error } so the window can show the reason.
+const netCall = (fn) => async (_e, arg) => {
+  if (!network) return { ok: false, error: 'Connect isn\'t running.' };
+  try {
+    return { ok: true, ...((await fn(arg ?? {})) ?? {}) };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+};
+
+ipcMain.handle('network:state', netCall(() => ({ state: { ...network.snapshot(), remoteModels: network.remoteModels() } })));
+ipcMain.handle('network:setShare', netCall((patch) => network.setShare(patch)));
+ipcMain.handle('network:newCode', netCall(() => network.newPairingCode()));
+ipcMain.handle('network:pair', netCall((arg) => network.pair(arg)));
+ipcMain.handle('network:unpair', netCall(({ id }) => network.unpair(id)));
+ipcMain.handle('network:rename', netCall(({ name }) => network.rename(name)));
+ipcMain.handle('network:setRelay', netCall(({ url }) => network.setRelay(url)));
+ipcMain.handle('network:group', netCall(({ t, ...payload }) => {
+  if (!['create', 'invite', 'join', 'approve', 'leave', 'remove'].includes(t)) throw new Error('Unknown group command.');
+  return network.groupCommand(t, payload);
+}));
+ipcMain.handle('network:poolEstimate', netCall(({ peerIds }) => network.poolEstimate(peerIds ?? [])));
+ipcMain.handle('network:loadPool', netCall((arg) => network.loadPool(arg)));
+ipcMain.handle('network:setBackground', netCall(({ model }) => {
+  const s = readSettings();
+  writeSettings({ ...s, network: { ...(s.network ?? {}), background: String(model ?? '') } });
+}));
+ipcMain.handle('network:setBusy', (_e, busy) => { network?.setLocalBusy(!!busy); return true; });
 
 ipcMain.handle('chat:abort', (_e, requestId) => {
   streams.get(requestId)?.abort();

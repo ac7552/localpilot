@@ -20,7 +20,19 @@ clarifying questions.
   click. Counts are exact on the LocalPilot engine and calibrated elsewhere; answer sizes and speeds come from your
   own past runs. Tips flag a full context, effort or mode that doesn't fit the request, long pastes, vague or
   bundled requests and changes that make the whole chat be read again; *Improve prompt* has the model rewrite it
-- **Network plan:** [`docs/NETWORK_PLAN.md`](docs/NETWORK_PLAN.md) covers sharing models across machines (not built yet)
+- **Connect** (sidebar): use models on other machines, or share this one
+  - *Share this computer*: its loaded model, and/or memory for pooled models, with a limit; pauses for others
+    while you use it. Shows a 6-digit pairing code
+  - *On this network*: machines found with Bonjour (or added by address); pair once with the code, then they
+    reconnect by themselves
+  - *Remote groups*: through a relay you run (see [`relay/`](relay/README.md)); invite codes, approvals
+  - Shared models appear in the model picker by network and group, plus *Best available* (picks a free machine,
+    keeps a chat on the same one, moves on if it leaves). The status at the top says where a chat is running
+  - *Pooled model*: split a model too big for this Mac across machines' memory (llama.cpp RPC), with a measured
+    speed estimate before loading over the internet
+  - *Background jobs* can run on another machine
+  - Machines prove who they are with device keys (kept in the Keychain) and talk over end-to-end encrypted
+    links; the relay can't read them. Design and limits: [`docs/NETWORK_PLAN.md`](docs/NETWORK_PLAN.md)
 - **Project memory:** each project can keep a `LOCALPILOT.md` that is loaded into the chat (you're warned when it's
   too long to fit)
 - **Memory layer** (*Memory & skills*): after 2 idle minutes with a model loaded, finished chats are summarized into a

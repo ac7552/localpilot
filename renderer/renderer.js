@@ -29,7 +29,7 @@ const NEEDS_APPROVAL = {
 
 // Each model family's recommended sampling settings (from the model authors).
 function samplingFor(modelKey, thinking) {
-  const arch = state.models.downloaded.find((m) => m.modelKey === modelKey)?.architecture || '';
+  const arch = modelInfo(modelKey)?.architecture || '';
   if (/^gemma/.test(arch)) return { temperature: 0.6, top_k: 64, top_p: 0.9, min_p: 0.05, repeat_penalty: 1.1 };
   if (/^qwen/.test(arch)) {
     return thinking
@@ -199,7 +199,10 @@ const state = {
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const fmt = (n) => (n >= 10000 ? (n / 1000).toFixed(1) + 'k' : (n ?? 0).toLocaleString());
 const tildify = (p) => p.replace(/^\/Users\/[^/]+/, '~');
-const modelInfo = (key) => state.models.downloaded.find((m) => m.modelKey === key);
+// Models on other machines (Connect) are listed as remote:<machine>:<model> or route:<network or group>.
+const isRemoteKey = (key) => /^(remote|route):/.test(String(key ?? ''));
+const remoteInfo = (key) => (state.models.remote ?? []).find((m) => m.modelKey === key);
+const modelInfo = (key) => state.models.downloaded.find((m) => m.modelKey === key) ?? remoteInfo(key);
 
 // Count tokens roughly, treating each image as a fixed cost instead of its base64 size.
 function estimateTokens(messages) {
@@ -318,26 +321,58 @@ function renderStats() {
 // ---------- models ----------
 
 async function refreshModels() {
+  const remote = state.models.remote;
   try {
     state.models = await api.listModels();
   } catch {
     state.models = { downloaded: [], loaded: [] };
   }
-  const select = $('modelSelect');
+  state.models.remote ??= remote;  // Connect keeps this current between refreshes
   const current = state.settings.model || state.models.loaded[0]?.modelKey || state.models.downloaded[0]?.modelKey || '';
-  select.innerHTML = '';
-  for (const m of state.models.downloaded) {
-    select.append(el('option', { value: m.modelKey, text: `${m.displayName} · ${m.quantization?.name ?? ''}` }));
-  }
-  if (current) select.value = current;
   if (current !== state.settings.model) state.settings = await api.setSettings({ model: current });
+  renderModelSelect();
   renderModelStatus();
   renderModelRows();
   renderModelPickers();
 }
 
+// The picker: this Mac's models, then what other machines share, grouped by network or group.
+function renderModelSelect() {
+  const select = $('modelSelect');
+  const current = state.settings.model;
+  select.innerHTML = '';
+  const local = el('optgroup', { label: 'This Mac' });
+  for (const m of state.models.downloaded) {
+    local.append(el('option', { value: m.modelKey, text: `${m.displayName} · ${m.quantization?.name ?? ''}` }));
+  }
+  select.append(local);
+  const groups = new Map();
+  for (const m of state.models.remote ?? []) {
+    const scope = m.scopes?.[0] ?? 'lan';
+    if (!groups.has(scope)) groups.set(scope, []);
+    groups.get(scope).push(m);
+  }
+  for (const [scope, items] of groups) {
+    const label = scope === 'lan' ? 'On this network' : (state.network?.groups?.find((g) => g.id === scope)?.name ?? 'Your group');
+    const og = el('optgroup', { label });
+    items.sort((a, b) => (b.route ? 1 : 0) - (a.route ? 1 : 0));
+    for (const m of items) {
+      const text = m.route
+        ? `Best available · ${m.free} of ${m.machines} free`
+        : `${m.displayName} · ${m.peerName}${m.busy ? ' (busy)' : ''}`;
+      og.append(el('option', { value: m.modelKey, text }));
+    }
+    select.append(og);
+  }
+  // Keep a chosen remote model visible while its machine is away, instead of switching silently.
+  if (isRemoteKey(current) && !remoteInfo(current)) {
+    select.append(el('option', { value: current, text: `${current.startsWith('route:') ? 'Best available' : 'Remote model'} (not connected)` }));
+  }
+  if (current) select.value = current;
+}
+
 function loadedInfo(modelKey) {
-  return state.models.loaded.find((m) => m.modelKey === modelKey);
+  return state.models.loaded.find((m) => m.modelKey === modelKey) ?? remoteInfo(modelKey);
 }
 
 function renderModelStatus() {
@@ -347,10 +382,27 @@ function renderModelStatus() {
   if (state.loadingModel) {
     pill.classList.add('warn');
     pill.textContent = state.loadingModel;
+  } else if (info?.engine === 'remote') {
+    // Prompts go to someone else's machine: always say whose.
+    const served = state.servedBy?.[state.chat?.id];
+    pill.classList.add('remote');
+    if (info.route) {
+      pill.textContent = served ? `Running on ${served} · best available` : `Best available on ${info.scopeName} · ${info.free} free`;
+    } else {
+      pill.textContent = `Running on ${info.peerName}${info.rtt != null ? ` · ${info.rtt} ms` : ''}${info.busy ? ' · busy' : ''}`;
+    }
+    pill.title = 'Your prompts are sent to this machine and answered by its model.';
+    state.contextMax = info.contextLength;
   } else if (info) {
     pill.classList.add('ok');
-    pill.textContent = `loaded · ${fmt(info.contextLength)} ctx · ${ENGINE_LABEL[info.engine] ?? 'LM Studio'}`;
+    pill.textContent = info.pooled?.length
+      ? `loaded · ${fmt(info.contextLength)} ctx · pooled with ${info.pooled.join(', ')}`
+      : `loaded · ${fmt(info.contextLength)} ctx · ${ENGINE_LABEL[info.engine] ?? 'LM Studio'}`;
     state.contextMax = info.contextLength;
+  } else if (isRemoteKey(state.settings.model)) {
+    pill.classList.add('bad');
+    pill.textContent = 'not connected';
+    state.contextMax = 0;
   } else if (!state.settings.model) {
     pill.classList.add('bad');
     pill.textContent = 'no models';
@@ -406,6 +458,11 @@ async function loadModel(modelKey, contextLength = state.settings.contextLength)
 }
 
 async function ensureModelReady() {
+  if (isRemoteKey(state.settings.model)) {
+    if (loadedInfo(state.settings.model)) return true;
+    notice('That machine isn\'t connected right now. Open Connect to check on it, or pick another model.', 'error');
+    return false;
+  }
   await api.ensureServer();
   if (loadedInfo(state.settings.model)) return true;
   if (!state.settings.model) {
@@ -2179,7 +2236,10 @@ async function runUpkeep(job, force) {
 // A request that isn't part of any chat. Returns the text, or null if stopped or failed.
 async function backgroundRequest(messages, maxTokens, job) {
   const scratch = { content: el('div'), meta: el('div'), tools: el('div'), setReasoning() {} };
-  const res = await streamOnce(requestBody(messages, { maxTokens, effortKey: 'low' }), scratch, { job });
+  // Connect can send background work to another machine, keeping this one free for the chat.
+  const bg = state.settings.network?.background;
+  const model = bg && loadedInfo(bg) ? bg : state.settings.model;
+  const res = await streamOnce(requestBody(messages, { maxTokens, effortKey: 'low', model }), scratch, { job });
   if (job.stopped || !res.ok || res.aborted || !res.content?.trim()) return null;
   return res.content.trim();
 }
@@ -2459,6 +2519,7 @@ function setBusy(busy) {
   $('newChatBtn').disabled = busy;
   if (!busy) showBanner(null);
   scheduleEstimate();
+  api.network?.setBusy(busy);  // machines sharing owners-first pause for others while you work
 }
 
 function stop() {
@@ -2565,7 +2626,7 @@ async function init() {
   $('modelSelect').addEventListener('change', async (e) => {
     state.settings = await api.setSettings({ model: e.target.value });
     renderModelStatus();
-    if (!loadedInfo(e.target.value)) await loadModel(e.target.value);
+    if (!isRemoteKey(e.target.value) && !loadedInfo(e.target.value)) await loadModel(e.target.value);
   });
   $('manageModelsBtn').addEventListener('click', () => { openModal('modelModal'); refreshModels(); });
   $('promptsBtn').addEventListener('click', () => { renderPromptRows(); openModal('promptsModal'); });

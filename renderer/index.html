@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="styles.css">
   <link rel="stylesheet" href="memory.css">
   <link rel="stylesheet" href="prompt-help.css">
+  <link rel="stylesheet" href="connect.css">
 </head>
 <body>
   <div id="brain" aria-hidden="true"><canvas id="brainCanvas"></canvas><canvas id="brainLive"></canvas></div>
@@ -27,6 +28,7 @@
         <button id="compareBtn" class="btn ghost small" title="Run one prompt on two models side by side">Compare models</button>
         <button id="promptsBtn" class="btn ghost small" title="Saved prompts you can use with /name">Saved prompts</button>
         <button id="memoryBtn" class="btn ghost small" title="Journal, skills and notes the model keeps">Memory &amp; skills <span id="memoryBadge" class="badge hidden">0</span></button>
+        <button id="connectBtn" class="btn ghost small" title="Use models on other machines, or share this one">Connect <span id="connectBadge" class="badge hidden">0</span></button>
       </div>
       <div class="section-label">Chats</div>
       <ul id="chatList" class="chat-list"></ul>
@@ -290,10 +292,21 @@
     </div>
   </div>
 
+  <div id="connectModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="connectTitle">
+    <div class="modal-card connect-card">
+      <div class="modal-head">
+        <h2 id="connectTitle">Connect</h2>
+        <button class="btn ghost small close-modal" aria-label="Close">✕</button>
+      </div>
+      <div id="connectBody"></div>
+    </div>
+  </div>
+
   <script src="../node_modules/marked/lib/marked.umd.js"></script>
   <script src="../node_modules/dompurify/dist/purify.min.js"></script>
   <script src="neurons.js"></script>
   <script src="neural-ui.js"></script>
   <script src="renderer.js"></script>
+  <script src="connect.js"></script>
 </body>
 </html>

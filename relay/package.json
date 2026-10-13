@@ -1,0 +1,16 @@
+{
+  "name": "localpilot-relay",
+  "version": "0.1.0",
+  "description": "Relay that links LocalPilot machines in the same group; it forwards encrypted traffic it can't read",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  }
+}

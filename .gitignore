@@ -4,3 +4,4 @@ build/icon.iconset/
 .DS_Store
 *.log
 __pycache__/
+relay/data/

@@ -1,7 +1,13 @@
 # Sharing models across machines
 
 Plan for letting LocalPilot use other people's computers, on the same home network or in a group across the
-internet, with no setup beyond installing the app and entering a code. Nothing here is built yet.
+internet, with no setup beyond installing the app and entering a code.
+
+**Status (2026-10-13):** phases 1–4 are built: `network/` (device keys, encrypted channel, pairing, Bonjour,
+routing, RPC tunnels), `relay/` (groups, invites, pipes; deploy steps in `relay/README.md`) and the Connect
+panel (`renderer/connect.js`). Not built yet: phase 0 (bundled llama.cpp, signed installers, so helpers still
+need LocalPilot and llama.cpp set up by hand), phase 5 (browser access), and the relay isn't deployed. Pooled
+models need llama.cpp built with RPC in `~/llama.cpp/build-rpc`. The droplet speed test is still to do.
 
 ## Roles
 
@@ -91,12 +97,12 @@ discovery. Paired machines on the same network always talk directly, even if the
 
 | Phase | Delivers | Size |
 |---|---|---|
-| 0 | Installable app: bundled llama.cpp (one pinned version, RPC on, Ventura patch), built-in model downloads for helpers, signed installers and auto-update, an engine list in place of `API`/`ENGINE_API` | L |
-| 1 | Gateway, device keys, pairing, Bonjour; Connect panel with the *Share* and *On this network* sections | M |
-| 2 | Remote engines on the home network: routing, chats staying on one machine, failover, owners first, background jobs on idle machines | M |
-| 3 | Relay on the droplet and remote groups: invites, approvals, end-to-end encryption | L |
-| 4 | Pooled models: home network first, then internet pooling with link measurement and estimates (after the droplet test) | M–L |
-| 5 | Browser access to the interface over WebSocket, with pairing, Manual mode by default and a log of commands run from the web | L |
+| 0 | *Not built.* Installable app: bundled llama.cpp (one pinned version, RPC on, Ventura patch), built-in model downloads for helpers, signed installers and auto-update, an engine list in place of `API`/`ENGINE_API` | L |
+| 1 | *Built.* Gateway, device keys, pairing, Bonjour; Connect panel with the *Share* and *On this network* sections | M |
+| 2 | *Built.* Remote engines on the home network: routing, chats staying on one machine, failover, owners first, background jobs on idle machines | M |
+| 3 | *Built, not deployed.* Relay on the droplet and remote groups: invites, approvals, end-to-end encryption | L |
+| 4 | *Built.* Pooled models: home network first, then internet pooling with link measurement and estimates (after the droplet test) | M–L |
+| 5 | *Not built.* Browser access to the interface over WebSocket, with pairing, Manual mode by default and a log of commands run from the web | L |
 
 Code that changes first:
 
