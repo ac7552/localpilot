@@ -120,14 +120,15 @@ const BASE_TOOLS = [
   },
   {
     name: 'run_command',
-    description: 'Run a shell command (zsh) in the workspace folder and get its output. Use for running scripts, tests, installing packages, or checking things. Commands are stopped after the timeout; do not start servers that run forever.',
+    description: 'Run a shell command (zsh) in the workspace folder and get its output. Use it to run the scripts you write, tests, package installs and checks yourself instead of asking the user to. The user sees your reason and approves before it runs. Commands are stopped after the timeout; do not start servers that run forever.',
     parameters: {
       type: 'object',
       properties: {
         command: { type: 'string' },
+        reason: { type: 'string', description: 'One short sentence for the user: why you want to run this, e.g. "Run the new script to check it prints the totals."' },
         timeout_sec: { type: 'integer', description: 'Max seconds to run (default 60, max 300).' },
       },
-      required: ['command'],
+      required: ['command', 'reason'],
     },
   },
   {
@@ -907,11 +908,13 @@ function systemPrompt(memory = {}) {
       'Put each new project in its own subfolder unless the user says otherwise.',
       'Each project folder can have a short LOCALPILOT.md notes file (goal, stack, how to run, key decisions). Create one for new projects and keep it current when something important changes.',
       'If the request is ambiguous or you are not sure what the user wants, call ask_user with a clear question and 2-4 options instead of guessing.',
+      'Run what you write: after creating or changing a script, run it (or its tests) with run_command and fix any errors, instead of asking the user to run it. Give a short reason with each command; the user reads it when approving.',
+      'Only ask the user to run something themselves when it needs them: a password or sudo, typing input while it runs, a GUI, or a server that keeps running.',
       'Never run destructive commands (rm -rf, sudo, disk or system changes) unless the user explicitly asked for exactly that.',
       'When finished, reply with a short summary of what you made and how to use it.',
       mode === 'manual'
         ? 'The user approves every file change and command by hand.'
-        : 'File changes happen automatically; the user approves each command.',
+        : 'File changes happen automatically; the user approves each command after reading your reason.',
     );
     if (state.settings.selfCheck !== false) {
       lines.push('After each file change the app automatically checks it (syntax check, or loading HTML pages and catching JavaScript errors) and appends the result. If a check fails, fix it.');
@@ -1904,6 +1907,7 @@ async function executeTool(tc, view, runId) {
   const untrustedFetch = name === 'fetch_url' && !state.chat.trustedUrls.includes(args.url);
   const needsApproval = untrustedFetch || NEEDS_APPROVAL[state.settings.mode]?.has(name);
   if (needsApproval) {
+    if (name === 'run_command' && args.reason) card.append(el('div', { class: 'tool-reason', text: String(args.reason) }));
     const preview = await approvalPreview(name, args);
     if (preview) card.append(el('div', { class: 'tool-body' }, el('pre', { text: preview })));
     const decision = await waitForApproval(card, name);

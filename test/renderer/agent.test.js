@@ -24,10 +24,12 @@ async function withApp(opts, replies, fn) {
 
 test('Auto mode: writes a file, asks before running a command, then answers', () => withApp({}, [
   { reasoning: 'Write the script first.', tools: [call('write_file', { path: 'hello/hello.py', content: 'print("hi from hello")\n' })] },
-  { tools: [call('run_command', { command: 'python3 hello/hello.py' })] },
+  { tools: [call('run_command', { command: 'python3 hello/hello.py', reason: 'Check the script prints its greeting.' })] },
   { content: 'Done! Run it with `python3 hello/hello.py`.' },
 ], async (app, model) => {
   const sending = app.start('Make a hello script and run it');
+  await app.waitFor(() => app.buttons('Run')[0], 'the approval card');
+  assert.equal(app.text(app.window.document.querySelector('.tool.pending .tool-reason')), 'Check the script prints its greeting.', 'the reason is shown');
   await app.click('Run');
   assert.equal(model.requests.length, 2, 'the command waits for approval');
   assert.match(app.$('banner').textContent, /Waiting for your approval/);

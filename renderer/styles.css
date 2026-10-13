@@ -143,6 +143,7 @@ details.thinking .think-body {
   margin: 0; padding: 10px 12px; max-height: 280px; overflow: auto; background: var(--code-bg);
   font-size: 12px; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap;
 }
+.tool-reason { padding: 8px 12px; border-top: 1px solid var(--border); font-size: 13px; }
 .tool-actions { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border); align-items: center; }
 .tool-actions .hint { color: var(--muted); font-size: 12px; margin-right: auto; }
 .tool.pending { border-color: var(--warn); }
@@ -425,7 +426,7 @@ details.thinking .think-body { border-left: 1px solid rgba(169, 76, 33, 0.4); fo
 .tool-head .arg { color: var(--text); }
 .tool-body { border-top-color: var(--border); }
 .tool-body pre { background: var(--code-bg); color: var(--text); }
-.tool-actions { border-top-color: var(--border); }
+.tool-reason, .tool-actions { border-top-color: var(--border); }
 .tool.pending { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(169, 76, 33, 0.08); }
 .undo-bar { border-style: dashed; background: transparent; }
 .check-line { border-top-color: var(--border); }
