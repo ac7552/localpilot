@@ -5,6 +5,11 @@ A desktop chat and coding agent for local models on macOS (Apple Silicon). It ta
 and can create and edit files, run commands (with your approval), search the web, read images, and ask you
 clarifying questions.
 
+![LocalPilot writing a script, asking before it runs it, and reporting the result](docs/images/demo.gif)
+
+*Qwen3.5 9B on the LocalPilot engine, Auto mode: it writes `budget.py` and a sample CSV, asks before running the
+command, then answers. Recorded on a 16 GB M-series Mac; the waiting parts are sped up.*
+
 ## Features
 
 - **Modes:** Chat (no tools), Manual (approve every change), Auto (file changes automatic, commands need approval)
@@ -61,6 +66,40 @@ npm install
 npm start                 # run in development
 npm run package           # build dist/LocalPilot-darwin-arm64/LocalPilot.app
 ```
+
+## Using LocalPilot
+
+1. **Pick a workspace.** Click the folder at the bottom of the sidebar. The model can only read and write inside it.
+2. **Pick a model.** Choose one in the **Model** menu at the top; it loads the first time you send. **Manage** lists
+   what's on your Mac with its size and engine, loads or unloads models, sets the context size, and downloads new
+   ones from Hugging Face. You can also have it pick a model per chat (one for coding, one for questions).
+
+   ![Models dialog](docs/images/models.png)
+
+3. **Set effort and mode.** *Effort* is how hard it thinks; *Mode* is how much it may do without asking. Auto mode
+   writes files on its own but shows every command with **Run** / **Deny** first, as in the recording above.
+4. **Check the estimate before you send.** Under the message box you'll see how much it has to read, about how long
+   the answer will be and take, and how much of the context it uses. Click the line for the breakdown. Tips flag
+   things like a bundled request or settings changes that make it read the whole chat again.
+
+   ![Estimate and tips under the message box](docs/images/estimate.png)
+
+   **Improve prompt** has the model rewrite a vague request into a specific one. Choose *Use this* or *Keep mine*.
+
+   ![Improve prompt](docs/images/improve-prompt.png)
+
+5. **Reuse prompts.** Type `/` for saved prompts. Whatever you type after the name fills in `{input}`. Add your own
+   under **Saved prompts**.
+
+   ![Saved prompts menu](docs/images/saved-prompts.png)
+
+6. **Review what it did.** Each tool call shows its file or command, the output and the self-check result. **Undo**
+   reverts every file the run changed. 👍 saves the chat as a training example, and **Save as skill** turns a good run
+   into a reusable skill.
+7. **Let it remember.** Under **Memory & skills**, finished chats are summarized into a journal the model can
+   search, and changes to the project's `LOCALPILOT.md` are proposed as a diff you can edit, reject or accept.
+
+   ![Memory & skills](docs/images/memory.png)
 
 ## The LocalPilot engine (llama.cpp)
 
