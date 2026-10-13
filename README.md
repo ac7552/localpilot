@@ -15,6 +15,12 @@ clarifying questions.
   addresses that didn't come from a search or your message need approval; private-network addresses are blocked
 - **Self-check:** syntax-checks Python/JS/shell/Ruby/JSON and loads HTML pages offline to catch JavaScript errors
 - **Context:** live context meter, token counters (in / out / thinking / cached), auto-compact at 80%
+- **Before you send** (*Estimate* and *Tips* under Extras, each can be turned off): a line under the message box
+  with the tokens to read (new vs cached), the answer size, the time and the share of context, with a breakdown on
+  click. Counts are exact on the LocalPilot engine and calibrated elsewhere; answer sizes and speeds come from your
+  own past runs. Tips flag a full context, effort or mode that doesn't fit the request, long pastes, vague or
+  bundled requests and changes that make the whole chat be read again; *Improve prompt* has the model rewrite it
+- **Network plan:** [`docs/NETWORK_PLAN.md`](docs/NETWORK_PLAN.md) covers sharing models across machines (not built yet)
 - **Project memory:** each project can keep a `LOCALPILOT.md` that is loaded into the chat (you're warned when it's
   too long to fit)
 - **Memory layer** (*Memory & skills*): after 2 idle minutes with a model loaded, finished chats are summarized into a

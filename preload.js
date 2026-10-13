@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('localpilot', {
   downloadModel: invoke('models:download'),
   onLoadProgress: (h) => subscribe('models:loadProgress', h),
   onDownloadProgress: (h) => subscribe('models:downloadProgress', h),
+  countTokens: invoke('tokens:count'),
 
   streamChat: invoke('chat:stream'),
   abort: invoke('chat:abort'),

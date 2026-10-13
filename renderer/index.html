@@ -7,6 +7,7 @@
   <title>LocalPilot</title>
   <link rel="stylesheet" href="styles.css">
   <link rel="stylesheet" href="memory.css">
+  <link rel="stylesheet" href="prompt-help.css">
 </head>
 <body>
   <div id="brain" aria-hidden="true"><canvas id="brainCanvas"></canvas><canvas id="brainLive"></canvas></div>
@@ -76,6 +77,8 @@
             <div class="toggles">
               <button id="webToggle" class="toggle" title="Let the model search the web and read pages. Searches leave your Mac.">Web</button>
               <button id="checkToggle" class="toggle" title="Automatically syntax-check / load files after the model writes them">Self-check</button>
+              <button id="estimateToggle" class="toggle" title="Before you send: about how many tokens and how long it will take">Estimate</button>
+              <button id="tipsToggle" class="toggle" title="Suggestions for a better prompt, and Improve prompt to have the model rewrite it">Tips</button>
             </div>
           </div>
 
@@ -108,6 +111,14 @@
           <textarea id="input" rows="1" placeholder="Ask for something…   Type / for saved prompts · Shift+Enter for a new line"></textarea>
           <button id="sendBtn" class="btn primary">Send</button>
           <button id="stopBtn" class="btn danger hidden">Stop</button>
+        </div>
+        <div id="promptHelp" class="prompt-help hidden">
+          <details id="estimate" class="estimate">
+            <summary id="estimateLine"></summary>
+            <div id="estimateDetail" class="estimate-detail"></div>
+          </details>
+          <div id="tips" class="tips"></div>
+          <div id="improveBox" class="improve hidden" aria-live="polite"></div>
         </div>
       </footer>
     </main>

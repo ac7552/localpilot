@@ -189,6 +189,7 @@ const state = {
   slashIndex: 0,
   skills: [],      // [{ name, description }] the model can load
   upkeep: null,    // the background memory job, if one is running
+  improve: null,   // the Improve prompt request, if one is running
   lastActivity: Date.now(),
   notesWarned: new Set(),
 };
@@ -276,6 +277,7 @@ function bindSegment(segId, key) {
     b.addEventListener('click', async () => {
       state.settings = await api.setSettings({ [key]: b.dataset.value });
       setSegment(segId, b.dataset.value);
+      scheduleEstimate();
     });
   });
 }
@@ -283,6 +285,9 @@ function bindSegment(segId, key) {
 function renderToggles() {
   $('webToggle').classList.toggle('on', !!state.settings.web);
   $('checkToggle').classList.toggle('on', state.settings.selfCheck !== false);
+  $('estimateToggle').classList.toggle('on', state.settings.estimate !== false);
+  $('tipsToggle').classList.toggle('on', state.settings.promptTips !== false);
+  scheduleEstimate();
 }
 
 function renderWorkspace() {
@@ -307,6 +312,7 @@ function renderStats() {
   const bar = $('ctxBar');
   bar.style.width = pct + '%';
   bar.style.background = pct > 85 ? 'var(--danger)' : pct > 65 ? 'var(--warn)' : 'var(--ok)';
+  scheduleEstimate();  // the estimate depends on the chat, the model and the context size
 }
 
 // ---------- models ----------
@@ -921,6 +927,7 @@ function fitToContext(maxTokens, memory) {
 function streamOnce(body, view, { slotOwner = null, job = null } = {}) {
   return new Promise((resolve) => {
     const requestId = uid();
+    const startedAt = performance.now();
     if (job) job.requestId = requestId;
     else state.requestId = requestId;
     let content = '';
@@ -965,7 +972,9 @@ function streamOnce(body, view, { slotOwner = null, job = null } = {}) {
     api.streamChat({ requestId, body, slotOwner }).then((res) => {
       off();
       const seconds = firstTokenAt ? (performance.now() - firstTokenAt) / 1000 : 0;
-      resolve({ ...res, content, reasoning, toolCalls: toolCalls.filter(Boolean), usage, seconds, finishReason });
+      // Time to the first token: reading the prompt (plus any cache restore) before writing.
+      const ttft = firstTokenAt ? (firstTokenAt - startedAt) / 1000 : 0;
+      resolve({ ...res, content, reasoning, toolCalls: toolCalls.filter(Boolean), usage, seconds, ttft, finishReason });
     });
   });
 }
@@ -1089,6 +1098,7 @@ function renderAttachments() {
     tray.append(el('div', { class: 'thumb' }, el('img', { src: a.dataUrl, alt: a.name }), rm));
   });
   tray.classList.toggle('hidden', !state.attachments.length);
+  scheduleEstimate();
 }
 
 // ---------- the agent loop ----------
@@ -1107,6 +1117,7 @@ async function send() {
   input.value = '';
   autoGrow();
   $('slashMenu').classList.add('hidden');
+  resetPromptHelp();
 
   const firstMessage = !state.chat.messages.length;
   if (firstMessage) {
@@ -1136,6 +1147,7 @@ async function send() {
 async function runAgent() {
   setBusy(true);
   const runId = uid();
+  let run = null;  // what this run used, for the estimate under the message box
   try {
     await stopUpkeep();
     if (!(await ensureModelReady())) return;
@@ -1146,6 +1158,8 @@ async function runAgent() {
     // prompt would make the engine reprocess the whole conversation on every later step.
     const memory = await loadMemory();
     warnCutNotes(memory);
+    state.chat.prefixKey = prefixKeyFor(state.settings.model, systemPrompt(memory), wrapTools(tools));
+    run = startRun();
     let escalated = false;
     let toolErrors = 0;
     let usedWeb = false;
@@ -1171,7 +1185,8 @@ async function runAgent() {
       view.meta.textContent = 'working…';
       scrollToBottom(true);
 
-      const res = await streamOnce(requestBody(apiMessages(memory), { maxTokens, tools, effortKey }), view, { slotOwner: state.chat.id });
+      const body = requestBody(apiMessages(memory), { maxTokens, tools, effortKey });
+      const res = await streamOnce(body, view, { slotOwner: state.chat.id });
       if (!res.ok) {
         view.meta.textContent = '';
         notice(res.error, 'error');
@@ -1179,6 +1194,7 @@ async function runAgent() {
       }
 
       recordUsage(res, view);
+      observeStep(run, res, body);
       const assistantMsg = { role: 'assistant', content: res.content, reasoning: res.reasoning, meta: view.meta.textContent };
       if (res.toolCalls.length) assistantMsg.tool_calls = res.toolCalls;
       state.chat.messages.push(assistantMsg);
@@ -1219,6 +1235,7 @@ async function runAgent() {
         notice(`Reached the ${effort.maxSteps}-step limit for ${state.settings.effort} effort. Say "continue" to keep going, or raise the effort.`);
       }
     }
+    run.completed = !!finalMsg && !state.stopRequested;
 
     if (finalMsg) {
       finalView.actions.append(...answerActions(finalMsg));
@@ -1238,6 +1255,7 @@ async function runAgent() {
       }
     } catch { /* nothing changed */ }
     await saveChat();
+    await saveRunStats(run).catch(() => {});
     setBusy(false);
   }
 }
@@ -1300,6 +1318,408 @@ function recordUsage(res, view) {
   if (res.reasoning) view.setReasoning(res.reasoning, false);
   if (res.content) renderMarkdown(view.content, res.content);
   renderStats();
+}
+
+// ---------- prompt estimate & tips ----------
+// Under the message box, before sending: about how many tokens the request will read and write
+// and how long it will take, plus quick suggestions for a better prompt and an optional rewrite
+// (Improve prompt). The estimate learns from finished runs: token counts are calibrated against
+// what the engine reported, and run sizes and speeds are kept per model. Both can be turned off
+// under Extras.
+
+const ANSWER_GUESS = {  // output tokens for a whole run [typical, high], until there's history
+  low: { question: [150, 600], task: [1500, 5000] },
+  medium: { question: [600, 2500], task: [4000, 14000] },
+  high: { question: [1000, 4000], task: [6000, 20000] },
+  auto: { question: [200, 1200], task: [2500, 10000] },
+};
+const STEP_GUESS = { question: [1, 2], task: [3, 10] };
+const TOOL_RESULT_TOKENS = 600;  // rough size of what each later step reads back
+const DEFAULT_SPEED = { gen: 20, prefill: 300 };  // tokens per second, until measured
+const RUNS_KEPT = 30;
+const MIN_RUNS = 3;  // past runs needed before the answer range comes from history
+const TASK_VERBS = /\b(build|create|make|write|add|fix|implement|refactor|update|change|rename|delete|remove|set ?up|install|run|test|debug|convert|generate|scaffold|edit)\b/i;
+const QUESTION_START = /^(what|why|how|when|where|who|which|is|are|can|could|should|would|does|do|did|explain|tell me)\b/i;
+
+const IMPROVE_PROMPT = `Rewrite the user's request to a local coding assistant so it gets a better result in fewer steps and tokens.
+- Keep their intent and every specific detail: names, paths, numbers, code and error messages.
+- Make it concrete: say which files or folders are involved when the request implies them, and what done looks like (how to check that it works).
+- Cut filler and repetition. Don't add features or requirements they didn't ask for.
+- The assistant reads the user's files itself, so never ask for code to be pasted.
+- If the request is already clear and specific, return it unchanged.
+Reply with the rewritten request only: no preamble, no quotes, no commentary.`;
+
+const promptHelp = {
+  timer: null,
+  memory: { key: null, at: 0, value: {} },  // notes, re-read at most every 30 s while typing
+  exact: { key: null, n: null },            // last exact count from the engine
+  dismissed: new Set(),                     // tip ids dismissed for the message being written
+};
+
+const promptStats = () => state.settings.promptStats ?? {};
+const wrapTools = (tools) => (tools ? tools.map((t) => ({ type: 'function', function: t })) : []);
+
+function hashText(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
+// The engine keeps a chat's prompt cached only while the start of the prompt stays the same:
+// changing effort, mode or tools rewrites the system prompt, and the whole chat is read again.
+const prefixKeyFor = (model, system, tools) => hashText(`${model}\n${system}\n${JSON.stringify(tools)}`);
+
+function requestKind(text) {
+  const head = text.trim().slice(0, 160);
+  if (QUESTION_START.test(head) && !/\b(build|create|make|write|implement)\b/i.test(head)) return 'question';
+  return TASK_VERBS.test(head) ? 'task' : 'question';
+}
+
+function lastUserText() {
+  const m = [...state.chat.messages].reverse().find((x) => x.role === 'user' && !x.hidden);
+  return m ? textOf(m.content) : '';
+}
+
+const runKey = (kind) => `${state.settings.model}|${state.settings.effort}|${state.settings.mode === 'chat' ? 'chat' : 'tools'}|${kind}`;
+
+function startRun() {
+  const kind = requestKind(lastUserText());
+  return { model: state.settings.model, key: runKey(kind), steps: 0, out: 0, calib: [], gen: [], prefill: [], completed: false };
+}
+
+// Compare each request with what the engine reported: how far off the token estimate was,
+// and how fast it read the prompt and wrote the answer.
+function observeStep(run, res, body) {
+  const u = res.usage;
+  if (!run || !u) return;
+  run.steps++;
+  run.out += u.completion_tokens ?? 0;
+  const guess = estimateTokens(body.messages) + (body.tools ? JSON.stringify(body.tools).length / 3.3 : 0);
+  if (u.prompt_tokens > 500 && guess > 0) run.calib.push(u.prompt_tokens / guess);
+  if (u.completion_tokens > 20 && res.seconds > 0.5) run.gen.push(u.completion_tokens / res.seconds);
+  // Reading speed needs to know how much was cached; without that, only a chat's first request counts.
+  const cachedKnown = u.prompt_tokens_details?.cached_tokens != null;
+  const fresh = (u.prompt_tokens ?? 0) - (u.prompt_tokens_details?.cached_tokens ?? 0);
+  if ((cachedKnown || state.chat.usage.requests === 1) && fresh > 256 && res.ttft > 0.2) run.prefill.push(fresh / res.ttft);
+}
+
+async function saveRunStats(run) {
+  if (!run?.steps) return;
+  const ps = structuredClone(promptStats());
+  const avg = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+  const ema = (old, x) => (old == null ? x : old * 0.7 + x * 0.3);
+  if (run.calib.length) {
+    ps.calib = { ...ps.calib, [run.model]: Math.min(2, Math.max(0.5, ema(ps.calib?.[run.model], avg(run.calib)))) };
+  }
+  const speed = { ...(ps.speed?.[run.model] ?? {}) };
+  if (run.gen.length) speed.gen = ema(speed.gen, avg(run.gen));
+  if (run.prefill.length) speed.prefill = ema(speed.prefill, avg(run.prefill));
+  ps.speed = { ...ps.speed, [run.model]: speed };
+  if (run.completed) {
+    ps.runs = { ...ps.runs, [run.key]: [...(ps.runs?.[run.key] ?? []), { out: run.out, steps: run.steps }].slice(-RUNS_KEPT) };
+  }
+  state.settings = await api.setSettings({ promptStats: ps });
+}
+
+async function cachedMemory() {
+  const key = `${state.settings.workspace}|${state.chat.project ?? ''}`;
+  const m = promptHelp.memory;
+  if (m.key !== key || Date.now() - m.at > 30_000) {
+    m.value = await loadMemory();
+    m.key = key;
+    m.at = Date.now();
+  }
+  return m.value;
+}
+
+async function exactCount(model, text) {
+  if (loadedInfo(model)?.engine !== 'llamacpp') return null;
+  const key = `${model}\n${text}`;
+  if (promptHelp.exact.key !== key) {
+    promptHelp.exact = { key, n: await api.countTokens({ model, text }).catch(() => null) };
+  }
+  return promptHelp.exact.n;
+}
+
+function answerRange(kind) {
+  const chatMode = state.settings.mode === 'chat';
+  const runs = promptStats().runs?.[runKey(kind)] ?? [];
+  if (runs.length >= MIN_RUNS) {
+    const pick = (k, p) => {
+      const v = runs.map((r) => r[k]).sort((a, b) => a - b);
+      return v[Math.min(v.length - 1, Math.floor(p * v.length))];
+    };
+    return { out: [pick('out', 0.5), pick('out', 0.9)], steps: [pick('steps', 0.5), pick('steps', 0.9)], learned: runs.length };
+  }
+  const guess = ANSWER_GUESS[state.settings.effort] ?? ANSWER_GUESS.medium;
+  const out = chatMode && kind === 'task' ? guess.question.map((n) => n * 2) : guess[kind];
+  return { out, steps: chatMode ? [1, 1] : STEP_GUESS[kind], learned: 0 };
+}
+
+async function estimateRequest(text, kind) {
+  const model = state.settings.model;
+  const stats = promptStats();
+  const calib = stats.calib?.[model] ?? 1;
+  const memory = await cachedMemory();
+  const tools = wrapTools(state.settings.mode !== 'chat' ? activeTools() : null);
+  const system = systemPrompt(memory);
+  const images = state.attachments.length * IMAGE_TOKENS;
+  const parts = {
+    system: Math.round(estimateTokens([{ role: 'system', content: system }]) * calib),
+    tools: Math.round((tools.length ? JSON.stringify(tools).length / 3.3 : 0) * calib),
+    history: Math.round(estimateTokens(toApiMessages(state.chat.messages)) * calib),
+    message: Math.round((text.length / 3.3) * calib) + images + 4,
+  };
+  const exact = await exactCount(model, text);
+  if (exact != null) parts.message = exact + images + 4;
+  const total = parts.system + parts.tools + parts.history + parts.message;
+  const prefix = total - parts.message;
+
+  const loaded = !!loadedInfo(model);
+  const continuing = loaded && state.chat.messages.length > 0 && !!state.chat.prefixKey;
+  const samePrefix = continuing && state.chat.prefixKey === prefixKeyFor(model, system, tools);
+  const cached = samePrefix ? prefix : 0;
+  const reread = continuing && !samePrefix ? prefix : 0;
+
+  const answer = answerRange(kind);
+  const speed = { ...DEFAULT_SPEED, ...(stats.speed?.[model] ?? {}) };
+  const toRead = total - cached;
+  const secs = [0, 1].map((i) => toRead / speed.prefill + answer.out[i] / speed.gen
+    + (answer.steps[i] - 1) * (TOOL_RESULT_TOKENS / speed.prefill));
+  const max = state.contextMax || 0;
+  const userTurns = state.chat.messages.filter((m) => m.role === 'user' && !m.hidden).length;
+  return {
+    parts, total, cached, reread, toRead, answer, secs, speed, max, loaded,
+    exact: exact != null,
+    calibrated: !!stats.calib?.[model],
+    measured: !!stats.speed?.[model]?.gen,
+    compactSoon: !!max && userTurns >= 2 && total > max * AUTO_COMPACT_AT,
+  };
+}
+
+const approxTok = (n) => (n < 1000 ? String(Math.max(10, Math.round(n / 10) * 10))
+  : `${(n / 1000).toFixed(n < 10000 ? 1 : 0).replace(/\.0$/, '')}k`);
+const tokRange = ([a, b]) => (approxTok(a) === approxTok(b) ? approxTok(a) : `${approxTok(a)}–${approxTok(b)}`);
+
+function approxTime(s) {
+  if (s < 8) return 'a few seconds';
+  if (s < 55) return `${Math.round(s / 5) * 5} s`;
+  if (s < 3600) return `${Math.max(1, Math.round(s / 60))} min`;
+  return `${(s / 3600).toFixed(1)} h`;
+}
+
+function timeRange([a, b]) {
+  const x = approxTime(a);
+  const y = approxTime(b);
+  return x === y ? `about ${x}` : `${x} to ${y}`;
+}
+
+function renderEstimate(est) {
+  const tools = state.settings.mode !== 'chat';
+  const steps = est.answer.steps[0] === est.answer.steps[1] ? `${est.answer.steps[0]}` : `${est.answer.steps[0]}–${est.answer.steps[1]}`;
+  const pieces = [
+    est.cached ? `≈ ${approxTok(est.toRead)} new · ${approxTok(est.cached)} cached` : `≈ ${approxTok(est.toRead)} to read`,
+    `answer ${tokRange(est.answer.out)}${tools && est.answer.steps[1] > 1 ? ` over ${steps} steps` : ''}`,
+    est.loaded ? timeRange(est.secs) : 'model not loaded',
+  ];
+  if (est.max) pieces.push(est.compactSoon ? 'will compact first' : `${Math.round((est.total / est.max) * 100)}% of context`);
+  $('estimateLine').textContent = pieces.join(' · ');
+  $('estimate').classList.toggle('warn', est.compactSoon);
+
+  const detail = $('estimateDetail');
+  detail.innerHTML = '';
+  const row = (label, n, cls = '') => detail.append(el('span', { class: cls, text: label }), el('span', { class: `n ${cls}`, text: fmt(n) }));
+  row('System prompt and notes', est.parts.system);
+  if (est.parts.tools) row('Tool definitions', est.parts.tools);
+  if (est.parts.history) row('Conversation so far', est.parts.history);
+  row(`Your message${est.exact ? ' (exact)' : ''}${state.attachments.length ? ' and images' : ''}`, est.parts.message);
+  row('Prompt', est.total, 'total');
+  if (est.cached) row('Already cached', est.cached);
+  const notes = [
+    est.answer.learned
+      ? `Answer size is from your last ${est.answer.learned} similar runs with this model, effort and mode.`
+      : `Answer size is a rough guess until you've done ${MIN_RUNS} similar runs with this model, effort and mode.`,
+    `Time assumes ${Math.round(est.speed.prefill)} tok/s reading and ${Math.round(est.speed.gen)} tok/s writing${est.measured ? ', measured on this model' : ' (defaults until measured)'}, and leaves out time spent running commands.`,
+    est.exact ? '' : `Counts are estimates${est.calibrated ? ', calibrated against what this model reported before' : ''}.`,
+    est.reread ? `Effort, mode or tools changed since the last message, so the whole chat is read again.` : '',
+  ];
+  detail.append(el('p', { class: 'note', text: notes.filter(Boolean).join(' ') }));
+}
+
+function tipsFor(text, kind, est) {
+  const s = state.settings;
+  const tools = s.mode !== 'chat';
+  const tips = [];
+  if (state.attachments.length && !modelInfo(s.model)?.vision) {
+    tips.push({ id: 'images', text: 'This model can\'t read images. Pick a vision model or remove them.' });
+  }
+  const userTurns = state.chat.messages.filter((m) => m.role === 'user' && !m.hidden).length;
+  if (est.max && userTurns >= 2 && est.parts.history > 1500 && est.total / est.max > 0.6) {
+    tips.push({
+      id: 'compact', label: 'Compact', run: () => compact(),
+      text: `Context is ${Math.round((est.total / est.max) * 100)}% full. Compacting first frees about ${approxTok(est.parts.history - 500)} tokens and keeps the key points.`,
+    });
+  }
+  if (est.reread > 2000) {
+    tips.push({ id: 'reread', text: `Effort, mode or tools changed since the last message, so the whole chat (${approxTok(est.reread)} tokens) is read again.` });
+  }
+  if (!tools && kind === 'task' && /\b(files?|folder|app|script|project|website|site|page|repo)\b/i.test(text)) {
+    tips.push({ id: 'mode', label: 'Use Auto mode', run: () => setPromptSetting('mode', 'auto'), text: 'Chat mode can\'t create or edit files. Auto mode lets it build this itself.' });
+  }
+  if (kind === 'question' && text.length < 200 && s.effort === 'high') {
+    tips.push({ id: 'effort-low', label: 'Use Low', run: () => setPromptSetting('effort', 'low'), text: 'A quick question on High effort. Low skips thinking and answers much sooner.' });
+  }
+  if (kind === 'task' && tools && s.effort === 'low') {
+    tips.push({
+      id: 'effort-up', label: 'Use Auto', run: () => setPromptSetting('effort', 'auto'),
+      text: `Low effort stops after ${EFFORT.low.maxSteps} steps, which is tight for building. Auto starts fast and thinks only when it needs to.`,
+    });
+  }
+  if (tools && !s.web && /\b(latest|newest|current(ly)?|today|this (week|month|year)|recent(ly)?|news|release notes|changelog|pricing|price|cve)\b/i.test(text)) {
+    tips.push({ id: 'web', label: 'Turn on Web', run: () => setPromptSetting('web', true), text: 'This sounds like it needs current information. Web lets the model look it up instead of guessing.' });
+  }
+  if (tools && est.parts.message > 1500 && (/```/.test(text) || text.split('\n').length > 40)) {
+    tips.push({ id: 'paste', text: `Long paste, about ${approxTok(est.parts.message)} tokens. If it's already a file in your workspace, give its path instead; the model reads only what it needs.` });
+  }
+  const items = text.split('\n').filter((l) => /^\s*(\d+[.)]|[-*•])\s+/.test(l) && TASK_VERBS.test(l));
+  if (tools && items.length >= 3) {
+    tips.push({ id: 'split', text: `${items.length} separate tasks in one message. Sending them one at a time gives each the full ${EFFORT[s.effort].maxSteps}-step budget and keeps the context smaller.` });
+  }
+  if (tools && kind === 'task' && !state.chat.messages.length && text.length < 80 && !/[\w-]+\.[a-z0-9]{1,6}\b|\//i.test(text)) {
+    tips.push({ id: 'vague', text: 'Name the file or folder, and say how you\'ll know it\'s done. Fewer guesses means fewer steps.' });
+  }
+  return tips.filter((t) => !promptHelp.dismissed.has(t.id)).slice(0, 3);
+}
+
+async function setPromptSetting(key, value) {
+  state.settings = await api.setSettings({ [key]: value });
+  if (key === 'effort') setSegment('effortSeg', value);
+  if (key === 'mode') setSegment('modeSeg', value);
+  renderToggles();
+}
+
+function renderTips(tips, raw) {
+  const row = $('tips');
+  row.innerHTML = '';
+  for (const t of tips) {
+    const chip = el('span', { class: 'tip' }, el('span', { text: t.text }));
+    if (t.run) chip.append(el('button', { class: 'btn small', text: t.label, onclick: () => t.run() }));
+    chip.append(el('button', {
+      class: 'tip-x', title: 'Dismiss', 'aria-label': 'Dismiss', text: '✕',
+      onclick: () => { promptHelp.dismissed.add(t.id); scheduleEstimate(); },
+    }));
+    row.append(chip);
+  }
+  if (raw.length >= 12 && loadedInfo(state.settings.model)) {
+    const btn = el('button', {
+      class: 'btn ghost small improve-btn', text: state.improve ? 'Improving…' : 'Improve prompt',
+      title: 'Have the model rewrite your prompt to be clearer and cheaper to run. Uses a few hundred tokens.',
+      onclick: improvePrompt,
+    });
+    btn.disabled = !!state.improve;
+    row.append(btn);
+  }
+}
+
+function scheduleEstimate() {
+  clearTimeout(promptHelp.timer);
+  promptHelp.timer = setTimeout(() => renderPromptHelp().catch((err) => console.warn('Estimate failed:', err)), 250);
+}
+
+async function renderPromptHelp() {
+  const box = $('promptHelp');
+  const showEstimate = state.settings.estimate !== false;
+  const showTips = state.settings.promptTips !== false;
+  const raw = $('input').value.trim();
+  if (!raw) {
+    promptHelp.dismissed.clear();
+    $('improveBox').classList.add('hidden');
+  }
+  if (!state.chat || state.busy || (!showEstimate && !showTips) || (!raw && !state.attachments.length)) {
+    box.classList.add('hidden');
+    return;
+  }
+  const text = expandSlash(raw) || 'Describe this image.';
+  const kind = requestKind(text);
+  const est = await estimateRequest(text, kind);
+  if ($('input').value.trim() !== raw) return;  // typed meanwhile; a newer render is on its way
+  $('estimate').classList.toggle('hidden', !showEstimate);
+  if (showEstimate) renderEstimate(est);
+  $('tips').classList.toggle('hidden', !showTips);
+  if (showTips) renderTips(tipsFor(text, kind, est), raw);
+  else $('improveBox').classList.add('hidden');
+  box.classList.remove('hidden');
+}
+
+function resetPromptHelp() {
+  cancelImprove();
+  promptHelp.dismissed.clear();
+  $('improveBox').classList.add('hidden');
+  scheduleEstimate();
+}
+
+function cancelImprove() {
+  const job = state.improve;
+  if (!job) return;
+  state.improve = null;
+  if (job.requestId) api.abort(job.requestId);
+}
+
+// Ask the model to rewrite the prompt. It runs like a background job: it doesn't touch the Stop
+// button, and sending a message (or turning Tips off) cancels it.
+async function improvePrompt() {
+  const original = $('input').value.trim();
+  if (!original || state.busy || state.improve) return;
+  const job = { requestId: null };
+  state.improve = job;
+  scheduleEstimate();
+  try {
+    await stopUpkeep();
+    const context = [
+      state.chat.project ? `Current project folder: ${state.chat.project}` : null,
+      state.chat.messages.length ? `This continues a conversation. The previous request was: ${lastUserText().slice(0, 300)}` : null,
+    ].filter(Boolean).join('\n');
+    const scratch = { content: el('div'), meta: el('div'), tools: el('div'), setReasoning() {} };
+    const res = await streamOnce(requestBody([
+      { role: 'system', content: IMPROVE_PROMPT },
+      { role: 'user', content: `${context ? `${context}\n\n` : ''}Request to rewrite:\n${expandSlash(original)}` },
+    ], { maxTokens: 700, effortKey: 'low' }), scratch, { job });
+    if (state.improve !== job || res.aborted) return;  // sent or cancelled meanwhile
+    if (!res.ok) {
+      notice(res.error, 'error');
+      return;
+    }
+    const better = (res.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim().replace(/^["“]([\s\S]*)["”]$/, '$1').trim();
+    if (better) showImproved(original, better);
+  } finally {
+    if (state.improve === job) state.improve = null;
+    state.lastActivity = Date.now();
+    scheduleEstimate();
+  }
+}
+
+function showImproved(original, better) {
+  const box = $('improveBox');
+  box.innerHTML = '';
+  if (better === original) {
+    box.append(el('span', { text: 'Your prompt is already clear. No changes suggested.' }));
+    box.classList.remove('hidden');
+    setTimeout(() => box.classList.add('hidden'), 4000);
+    return;
+  }
+  const use = el('button', {
+    class: 'btn small primary', text: 'Use this',
+    onclick: () => {
+      $('input').value = better;
+      autoGrow();
+      box.classList.add('hidden');
+      $('input').focus();
+      scheduleEstimate();
+    },
+  });
+  const keep = el('button', { class: 'btn small ghost', text: 'Keep mine', onclick: () => box.classList.add('hidden') });
+  box.append(el('div', { class: 'small', text: 'Suggested prompt' }), el('pre', { text: better }), el('div', { class: 'row' }, use, keep));
+  box.classList.remove('hidden');
 }
 
 // ---------- tool execution ----------
@@ -1551,6 +1971,7 @@ async function compact() {
     if (!(await ensureModelReady())) return;
     notice('Compacting conversation…');
     await compactCore();
+    state.chat.prefixKey = null;  // the next message is read in full
   } finally {
     setBusy(false);
   }
@@ -1642,7 +2063,7 @@ Rules:
 }
 
 function upkeepTick(force = false) {
-  if (state.upkeep || state.busy || state.loadingModel || !loadedInfo(state.settings.model)) return;
+  if (state.upkeep || state.busy || state.improve || state.loadingModel || !loadedInfo(state.settings.model)) return;
   if (!force && Date.now() - state.lastActivity < UPKEEP_IDLE_MS) return;
   const job = { requestId: null, stopped: false };
   state.upkeep = job;
@@ -1965,6 +2386,7 @@ function setBusy(busy) {
   $('compactBtn').disabled = busy;
   $('newChatBtn').disabled = busy;
   if (!busy) showBanner(null);
+  scheduleEstimate();
 }
 
 function stop() {
@@ -2007,9 +2429,18 @@ async function init() {
     state.settings = await api.setSettings({ selfCheck: state.settings.selfCheck === false });
     renderToggles();
   });
+  $('estimateToggle').addEventListener('click', async () => {
+    state.settings = await api.setSettings({ estimate: state.settings.estimate === false });
+    renderToggles();
+  });
+  $('tipsToggle').addEventListener('click', async () => {
+    state.settings = await api.setSettings({ promptTips: state.settings.promptTips === false });
+    if (state.settings.promptTips === false) cancelImprove();
+    renderToggles();
+  });
 
   const input = $('input');
-  input.addEventListener('input', () => { autoGrow(); state.slashIndex = 0; renderSlashMenu(); });
+  input.addEventListener('input', () => { autoGrow(); state.slashIndex = 0; renderSlashMenu(); scheduleEstimate(); });
   input.addEventListener('keydown', (e) => {
     const menuOpen = !$('slashMenu').classList.contains('hidden');
     if (menuOpen && ['ArrowDown', 'ArrowUp'].includes(e.key)) {

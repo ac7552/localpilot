@@ -39,6 +39,8 @@ const DEFAULT_SETTINGS = {
   effort: 'medium',
   mode: 'auto',
   contextLength: 16384,
+  estimate: true,     // token and time estimate under the message box
+  promptTips: true,   // prompt suggestions and Improve prompt
 };
 
 function readSettings() {
@@ -474,6 +476,25 @@ ipcMain.handle('chat:abort', (_e, requestId) => {
   const child = commands.get(requestId);
   if (child) child.kill('SIGTERM');
   return true;
+});
+
+// Exact token count for the estimate under the message box. Only the LocalPilot engine is asked;
+// for LM Studio the estimate is calibrated against the prompt sizes it reports instead.
+ipcMain.handle('tokens:count', async (_e, { model, text }) => {
+  if (!engine?.ready || engine.modelKey !== model) return null;
+  try {
+    const res = await fetch(`http://127.0.0.1:${ENGINE_PORT}/tokenize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: text }),
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return Array.isArray(json.tokens) ? json.tokens.length : null;
+  } catch {
+    return null;
+  }
 });
 
 // ---------- per-chat cache (LocalPilot engine) ----------
