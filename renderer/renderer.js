@@ -758,6 +758,10 @@ function assistantView() {
       thinkingSummary.textContent = live ? 'Thinking…' : `Thought (${fmt(Math.ceil(text.length / 4))} tokens approx.)`;
       if (live) thinkingBody.scrollTop = thinkingBody.scrollHeight;
     },
+    clearReasoning() {
+      thinking.classList.add('hidden');
+      thinkingBody.textContent = '';
+    },
   };
 }
 
@@ -1007,8 +1011,11 @@ function streamOnce(body, view, { slotOwner = null, job = null } = {}) {
       });
     };
 
-    const off = api.onChatChunk(({ requestId: rid, chunk }) => {
+    let ended;
+    const lastChunk = new Promise((r) => { ended = r; });
+    const off = api.onChatChunk(({ requestId: rid, chunk, done }) => {
       if (rid !== requestId) return;
+      if (done) { ended(); return; }
       if (chunk.usage) usage = chunk.usage;
       for (const choice of chunk.choices ?? []) {
         const d = choice.delta ?? {};
@@ -1026,8 +1033,18 @@ function streamOnce(body, view, { slotOwner = null, job = null } = {}) {
       scheduleRender();
     });
 
-    api.streamChat({ requestId, body, slotOwner }).then((res) => {
+    api.streamChat({ requestId, body, slotOwner }).then(async (res) => {
+      await lastChunk;
       off();
+      // Some models (Qwen3.5 after tool results) write the answer without closing their thinking,
+      // so it all arrives as reasoning and the turn looks empty. A stop, not a cut-off, means it's
+      // the answer.
+      if (!content && !toolCalls.length && reasoning.trim() && finishReason === 'stop' && !res.aborted) {
+        content = reasoning.trim();
+        reasoning = '';
+        view.clearReasoning?.();
+        if (view.content) renderMarkdown(view.content, content);
+      }
       const seconds = firstTokenAt ? (performance.now() - firstTokenAt) / 1000 : 0;
       // Time to the first token: reading the prompt (plus any cache restore) before writing.
       const ttft = firstTokenAt ? (firstTokenAt - startedAt) / 1000 : 0;
@@ -1216,6 +1233,7 @@ async function runAgent() {
     const memory = await loadMemory();
     warnCutNotes(memory);
     state.chat.prefixKey = prefixKeyFor(state.settings.model, systemPrompt(memory), wrapTools(tools));
+    state.chat.prefixParts = prefixPartsFor(state.settings.model, memory);
     run = startRun();
     let escalated = false;
     let toolErrors = 0;
@@ -1433,6 +1451,17 @@ function hashText(s) {
 // changing effort, mode or tools rewrites the system prompt, and the whole chat is read again.
 const prefixKeyFor = (model, system, tools) => hashText(`${model}\n${system}\n${JSON.stringify(tools)}`);
 
+// The parts of that prefix the user would recognize, so a re-read can say what changed. The notes
+// change when the agent itself writes LOCALPILOT.md, not only when the user edits them.
+const prefixPartsFor = (model, memory) => ({ model, notes: hashText(`${memory.root ?? ''}\n${memory.project ?? ''}`) });
+
+function rereadCause(before, now) {
+  if (!before) return 'Settings or notes changed';
+  if (before.model !== now.model) return 'You switched models';
+  if (before.notes !== now.notes) return 'The LOCALPILOT.md notes changed';
+  return 'Effort, mode or tools changed';
+}
+
 function requestKind(text) {
   const head = text.trim().slice(0, 160);
   if (QUESTION_START.test(head) && !/\b(build|create|make|write|implement)\b/i.test(head)) return 'question';
@@ -1605,6 +1634,7 @@ async function estimateRequest(text, kind) {
   const samePrefix = continuing && state.chat.prefixKey === prefixKeyFor(model, system, tools);
   const cached = samePrefix ? prefix : 0;
   const reread = continuing && !samePrefix ? prefix : 0;
+  const rereadWhy = reread ? rereadCause(state.chat.prefixParts, prefixPartsFor(model, memory)) : '';
 
   const scope = requestScope(text, kind, parts.message);
   const answer = answerRange(kind, scope);
@@ -1615,7 +1645,7 @@ async function estimateRequest(text, kind) {
   const max = state.contextMax || 0;
   const userTurns = state.chat.messages.filter((m) => m.role === 'user' && !m.hidden).length;
   return {
-    parts, total, cached, reread, toRead, answer, scope, kind, secs, speed, max, loaded,
+    parts, total, cached, reread, rereadWhy, toRead, answer, scope, kind, secs, speed, max, loaded,
     exact: exact != null,
     calibrated: !!stats.calib?.[model],
     measured: !!stats.speed?.[model]?.gen,
@@ -1670,7 +1700,7 @@ function renderEstimate(est) {
       : `${sized} A rough guess until you've done ${MIN_RUNS} similar runs with this model, effort and mode.`,
     `Time assumes ${Math.round(est.speed.prefill)} tok/s reading and ${Math.round(est.speed.gen)} tok/s writing${est.measured ? ', measured on this model' : ' (defaults until measured)'}, and leaves out time spent running commands.`,
     est.exact ? '' : `Counts are estimates${est.calibrated ? ', calibrated against what this model reported before' : ''}.`,
-    est.reread ? `Effort, mode or tools changed since the last message, so the whole chat is read again.` : '',
+    est.reread ? `${est.rereadWhy} since the last message, so the whole chat is read again.` : '',
   ];
   detail.append(el('p', { class: 'note', text: notes.filter(Boolean).join(' ') }));
 }
@@ -1690,7 +1720,7 @@ function tipsFor(text, kind, est) {
     });
   }
   if (est.reread > 2000) {
-    tips.push({ id: 'reread', text: `Effort, mode or tools changed since the last message, so the whole chat (${approxTok(est.reread)} tokens) is read again.` });
+    tips.push({ id: 'reread', text: `${est.rereadWhy} since the last message, so the whole chat (${approxTok(est.reread)} tokens) is read again.` });
   }
   if (!tools && kind === 'task' && /\b(files?|folder|app|script|project|website|site|page|repo)\b/i.test(text)) {
     tips.push({ id: 'mode', label: 'Use Auto mode', run: () => setPromptSetting('mode', 'auto'), text: 'Chat mode can\'t create or edit files. Auto mode lets it build this itself.' });

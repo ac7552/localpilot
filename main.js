@@ -512,6 +512,9 @@ ipcMain.handle('chat:stream', async (_e, { requestId, body, slotOwner = null }) 
     return await streamCompletion({ body, slotOwner, signal: controller.signal, onChunk });
   } finally {
     streams.delete(requestId);
+    // This reply can reach the renderer before the last chunks (often the usage), so the renderer
+    // waits for this marker, which comes after them on the same channel.
+    send('chat:chunk', { requestId, chunk: {}, done: true });
   }
 });
 
