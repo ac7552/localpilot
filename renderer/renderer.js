@@ -1337,7 +1337,14 @@ const STEP_GUESS = { question: [1, 2], task: [3, 10] };
 const TOOL_RESULT_TOKENS = 600;  // rough size of what each later step reads back
 const DEFAULT_SPEED = { gen: 20, prefill: 300 };  // tokens per second, until measured
 const RUNS_KEPT = 30;
-const MIN_RUNS = 3;  // past runs needed before the answer range comes from history
+const MIN_RUNS = 3;  // past runs needed before history corrects the answer range
+// Words that make a request smaller or bigger than a typical one of its kind.
+const SCOPE_SMALL = /\b(typo|rename|one[- ]?liner|quick(ly)?|brief(ly)?|short|tl;?dr|yes or no|single line|in a sentence|tiny)\b/gi;
+const SCOPE_LARGE = /\b(full|complete|entire|whole|from scratch|tests?|test suite|docs|documentation|readme|in detail|detailed|thorough(ly)?|step[- ]by[- ]step|compare|comparison|tutorial|guide|refactor|migrate|several)\b/gi;
+// Things that are big to make but not to change: they count only alongside a verb that creates.
+const SCOPE_BUILD = /\b(app|application|game|website|dashboard|api|server|backend|frontend|project|system|cli|extension|bot)\b/gi;
+const CREATE_VERBS = /\b(build|create|make|scaffold|generate|start|new)\b/i;
+const FILE_NAME = /\b[\w/-]+\.(js|jsx|ts|tsx|py|rb|go|rs|java|kt|swift|c|h|cpp|cs|php|html|css|scss|json|ya?ml|toml|md|sh|sql|txt|csv|ipynb)\b/gi;
 const TASK_VERBS = /\b(build|create|make|write|add|fix|implement|refactor|update|change|rename|delete|remove|set ?up|install|run|test|debug|convert|generate|scaffold|edit)\b/i;
 const QUESTION_START = /^(what|why|how|when|where|who|which|is|are|can|could|should|would|does|do|did|explain|tell me)\b/i;
 
@@ -1382,9 +1389,67 @@ function lastUserText() {
 
 const runKey = (kind) => `${state.settings.model}|${state.settings.effort}|${state.settings.mode === 'chat' ? 'chat' : 'tools'}|${kind}`;
 
+// How big the request looks next to a typical one of its kind (factor 1), and why. The answer
+// estimate scales with it, so the line under the message box follows what you're asking for.
+function requestScope(text, kind, messageTokens) {
+  const reasons = [];
+  let factor = 1;
+  const words = (re, s = text) => [...new Set((s.match(re) || []).map((w) => w.toLowerCase()))];
+  const prose = text.replace(FILE_NAME, ' ');  // README.md or src/api.ts aren't scope words
+  const small = words(SCOPE_SMALL, prose);
+  const large = [...words(SCOPE_LARGE, prose), ...(CREATE_VERBS.test(prose) ? words(SCOPE_BUILD, prose) : [])];
+  if (small.length) {
+    factor *= 0.4;
+    reasons.push(`smaller for “${small[0]}”`);
+  }
+  if (large.length) {
+    factor *= Math.min(3, 1.35 ** large.length);
+    reasons.push(`larger for ${large.slice(0, 3).map((w) => `“${w}”`).join(', ')}`);
+  }
+  const files = words(FILE_NAME).length;
+  if (files > 1) {
+    factor *= Math.min(2, 1 + 0.25 * (files - 1));
+    reasons.push(`${files} files named`);
+  }
+  const items = text.split('\n').filter((l) => /^\s*(\d+[.)]|[-*•])\s+/.test(l)).length;
+  if (items >= 2) {
+    factor *= Math.min(2.5, 1 + 0.3 * (items - 1));
+    reasons.push(`${items} items listed`);
+  }
+  const pasted = /```/.test(text);
+  if (text.length > 400 && !pasted) {
+    factor *= 1.2;
+    reasons.push('a detailed request');
+  }
+  // Pasted code usually gets reworked or explained, so the answer grows with it.
+  const extra = pasted ? Math.round(messageTokens * (kind === 'task' ? 0.6 : 0.3)) : 0;
+  if (extra > 100) reasons.push('pasted code');
+  return { factor: Math.min(4, Math.max(0.25, factor)), extra, reasons };
+}
+
+// The answer size and steps the request looks like before history corrects them.
+function answerBase(kind, scope) {
+  const chatMode = state.settings.mode === 'chat';
+  const guess = ANSWER_GUESS[state.settings.effort] ?? ANSWER_GUESS.medium;
+  const out = chatMode && kind === 'task' ? guess.question.map((n) => n * 2) : guess[kind];
+  return {
+    out: out.map((n) => Math.round(n * scope.factor + scope.extra)),
+    steps: (chatMode ? [1, 1] : STEP_GUESS[kind]).map((n) => clampSteps(n * Math.sqrt(scope.factor))),
+  };
+}
+
+// A run never takes more steps than its effort allows.
+const clampSteps = (n) => (state.settings.mode === 'chat' ? 1
+  : Math.min(EFFORT[state.settings.effort]?.maxSteps ?? 16, Math.max(1, Math.round(n))));
+
 function startRun() {
-  const kind = requestKind(lastUserText());
-  return { model: state.settings.model, key: runKey(kind), steps: 0, out: 0, calib: [], gen: [], prefill: [], completed: false };
+  const text = lastUserText();
+  const kind = requestKind(text);
+  const base = answerBase(kind, requestScope(text, kind, Math.ceil(text.length / 3.3)));
+  return {
+    model: state.settings.model, key: runKey(kind), steps: 0, out: 0, calib: [], gen: [], prefill: [], completed: false,
+    predicted: base.out[0], predictedSteps: base.steps[0],
+  };
 }
 
 // Compare each request with what the engine reported: how far off the token estimate was,
@@ -1416,7 +1481,8 @@ async function saveRunStats(run) {
   if (run.prefill.length) speed.prefill = ema(speed.prefill, avg(run.prefill));
   ps.speed = { ...ps.speed, [run.model]: speed };
   if (run.completed) {
-    ps.runs = { ...ps.runs, [run.key]: [...(ps.runs?.[run.key] ?? []), { out: run.out, steps: run.steps }].slice(-RUNS_KEPT) };
+    const record = { out: run.out, steps: run.steps, predicted: run.predicted, predictedSteps: run.predictedSteps };
+    ps.runs = { ...ps.runs, [run.key]: [...(ps.runs?.[run.key] ?? []), record].slice(-RUNS_KEPT) };
   }
   state.settings = await api.setSettings({ promptStats: ps });
 }
@@ -1441,19 +1507,21 @@ async function exactCount(model, text) {
   return promptHelp.exact.n;
 }
 
-function answerRange(kind) {
-  const chatMode = state.settings.mode === 'chat';
-  const runs = promptStats().runs?.[runKey(kind)] ?? [];
-  if (runs.length >= MIN_RUNS) {
-    const pick = (k, p) => {
-      const v = runs.map((r) => r[k]).sort((a, b) => a - b);
-      return v[Math.min(v.length - 1, Math.floor(p * v.length))];
-    };
-    return { out: [pick('out', 0.5), pick('out', 0.9)], steps: [pick('steps', 0.5), pick('steps', 0.9)], learned: runs.length };
-  }
-  const guess = ANSWER_GUESS[state.settings.effort] ?? ANSWER_GUESS.medium;
-  const out = chatMode && kind === 'task' ? guess.question.map((n) => n * 2) : guess[kind];
-  return { out, steps: chatMode ? [1, 1] : STEP_GUESS[kind], learned: 0 };
+// The request's own size, corrected by how past similar runs compared with their prediction:
+// if this model usually writes twice what was expected, the estimate doubles.
+function answerRange(kind, scope) {
+  const base = answerBase(kind, scope);
+  const runs = (promptStats().runs?.[runKey(kind)] ?? []).filter((r) => r.predicted > 0 && r.predictedSteps > 0);
+  if (runs.length < MIN_RUNS) return { ...base, learned: 0 };
+  const median = (a) => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
+  const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
+  const outFix = clamp(median(runs.map((r) => r.out / r.predicted)), 0.2, 5);
+  const stepFix = clamp(median(runs.map((r) => r.steps / r.predictedSteps)), 0.3, 4);
+  return {
+    out: base.out.map((n) => Math.round(n * outFix)),
+    steps: base.steps.map((n) => clampSteps(n * stepFix)),
+    learned: runs.length,
+  };
 }
 
 async function estimateRequest(text, kind) {
@@ -1481,7 +1549,8 @@ async function estimateRequest(text, kind) {
   const cached = samePrefix ? prefix : 0;
   const reread = continuing && !samePrefix ? prefix : 0;
 
-  const answer = answerRange(kind);
+  const scope = requestScope(text, kind, parts.message);
+  const answer = answerRange(kind, scope);
   const speed = { ...DEFAULT_SPEED, ...(stats.speed?.[model] ?? {}) };
   const toRead = total - cached;
   const secs = [0, 1].map((i) => toRead / speed.prefill + answer.out[i] / speed.gen
@@ -1489,7 +1558,7 @@ async function estimateRequest(text, kind) {
   const max = state.contextMax || 0;
   const userTurns = state.chat.messages.filter((m) => m.role === 'user' && !m.hidden).length;
   return {
-    parts, total, cached, reread, toRead, answer, secs, speed, max, loaded,
+    parts, total, cached, reread, toRead, answer, scope, kind, secs, speed, max, loaded,
     exact: exact != null,
     calibrated: !!stats.calib?.[model],
     measured: !!stats.speed?.[model]?.gen,
@@ -1535,10 +1604,13 @@ function renderEstimate(est) {
   row(`Your message${est.exact ? ' (exact)' : ''}${state.attachments.length ? ' and images' : ''}`, est.parts.message);
   row('Prompt', est.total, 'total');
   if (est.cached) row('Already cached', est.cached);
+  const sized = est.scope.reasons.length
+    ? `Sized as a ${est.kind}, ${est.scope.reasons.join('; ')}.`
+    : `Sized as a typical ${est.kind}.`;
   const notes = [
     est.answer.learned
-      ? `Answer size is from your last ${est.answer.learned} similar runs with this model, effort and mode.`
-      : `Answer size is a rough guess until you've done ${MIN_RUNS} similar runs with this model, effort and mode.`,
+      ? `${sized} Corrected by how your last ${est.answer.learned} similar runs with this model, effort and mode compared with their estimate.`
+      : `${sized} A rough guess until you've done ${MIN_RUNS} similar runs with this model, effort and mode.`,
     `Time assumes ${Math.round(est.speed.prefill)} tok/s reading and ${Math.round(est.speed.gen)} tok/s writing${est.measured ? ', measured on this model' : ' (defaults until measured)'}, and leaves out time spent running commands.`,
     est.exact ? '' : `Counts are estimates${est.calibrated ? ', calibrated against what this model reported before' : ''}.`,
     est.reread ? `Effort, mode or tools changed since the last message, so the whole chat is read again.` : '',
