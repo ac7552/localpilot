@@ -171,6 +171,13 @@ ipcMain.handle('workspace:choose', async () => {
 
 ipcMain.handle('workspace:reveal', () => shell.openPath(readSettings().workspace));
 
+// First name from the macOS account, for the greeting.
+ipcMain.handle('app:userName', () => {
+  const { spawnSync } = require('child_process');
+  const full = spawnSync('/usr/bin/id', ['-F'], { encoding: 'utf8' }).stdout?.trim() || '';
+  return full.split(/\s+/)[0] || '';
+});
+
 ipcMain.handle('chats:list', async () => {
   await fsp.mkdir(chatsDir(), { recursive: true });
   const files = (await fsp.readdir(chatsDir())).filter((f) => f.endsWith('.json'));

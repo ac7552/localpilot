@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('localpilot', {
   setSettings: invoke('settings:set'),
   chooseWorkspace: invoke('workspace:choose'),
   revealWorkspace: invoke('workspace:reveal'),
+  userName: invoke('app:userName'),
 
   listChats: invoke('chats:list'),
   loadChat: invoke('chats:load'),

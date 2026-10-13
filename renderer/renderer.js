@@ -606,12 +606,22 @@ function renderConversation() {
   scrollToBottom(true);
 }
 
+function greeting() {
+  const h = new Date().getHours();
+  const part = h < 5 ? 'Late night' : h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : h < 22 ? 'Good evening' : 'Late night';
+  return state.userName ? `${part}, ${state.userName}.` : `${part}.`;
+}
+
 function buildEmptyState() {
-  const tpl = document.createElement('div');
-  tpl.className = 'empty';
-  tpl.innerHTML = `
-    <h1>What do you want to build?</h1>
-    <p>Your model works inside your workspace folder. In <b>Auto</b> mode it writes files itself and asks before running commands. If your request is unclear, it asks you first. Type <b>/</b> for saved prompts, or paste an image.</p>`;
+  // Each word comes into focus in turn.
+  const words = greeting().split(' ').map((w, i) => {
+    const span = el('span', { class: 'word' }, w);
+    span.style.setProperty('--i', String(i));  // style attributes are blocked by the page's CSP
+    return span;
+  });
+  const h1 = el('h1', { class: 'greeting', 'aria-label': greeting() });
+  words.forEach((w, i) => h1.append(w, i < words.length - 1 ? ' ' : ''));
+  const tpl = el('div', { class: 'empty' }, h1);
   const sugg = el('div', { class: 'suggestions' });
   ['Build a tip calculator web app in index.html',
     'Write a Python script that organizes files in a folder by type',
@@ -1445,6 +1455,7 @@ function closeModals() {
 
 async function init() {
   state.settings = await api.getSettings();
+  state.userName = await api.userName().catch(() => '');
   setSegment('effortSeg', state.settings.effort);
   setSegment('modeSeg', state.settings.mode);
   bindSegment('effortSeg', 'effort');

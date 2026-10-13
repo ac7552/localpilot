@@ -8,6 +8,14 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+  <div id="brain" aria-hidden="true"><canvas id="brainCanvas"></canvas><canvas id="brainLive"></canvas></div>
+  <div id="loadRing" class="load-ring hidden" aria-live="polite">
+    <svg viewBox="0 0 100 100" aria-hidden="true">
+      <circle class="ring-track" cx="50" cy="50" r="48"></circle>
+      <circle class="ring-progress" cx="50" cy="50" r="48"></circle>
+    </svg>
+    <div class="ring-text"><span class="ring-label">Loading</span><span class="ring-sub">0%</span></div>
+  </div>
   <div class="app">
     <aside class="sidebar">
       <div class="drag-region"></div>
@@ -94,7 +102,7 @@
         <div class="composer-box">
           <button id="attachBtn" class="btn ghost icon" title="Attach images (or paste / drop them)">＋</button>
           <input id="fileInput" type="file" accept="image/*" multiple class="hidden">
-          <textarea id="input" rows="1" placeholder="Ask it to build or explain something…  Type / for saved prompts. Enter to send, Shift+Enter for a new line."></textarea>
+          <textarea id="input" rows="1" placeholder="Ask for something…   Type / for saved prompts · Shift+Enter for a new line"></textarea>
           <button id="sendBtn" class="btn primary">Send</button>
           <button id="stopBtn" class="btn danger hidden">Stop</button>
         </div>
@@ -201,6 +209,8 @@
 
   <script src="../node_modules/marked/lib/marked.umd.js"></script>
   <script src="../node_modules/dompurify/dist/purify.min.js"></script>
+  <script src="neurons.js"></script>
+  <script src="neural-ui.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>
