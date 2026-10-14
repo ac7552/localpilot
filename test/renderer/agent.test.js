@@ -172,6 +172,9 @@ test('bad tool arguments and unknown tools are reported, not run', () => withApp
   const [bad, unknown] = toolResults(model.requests[1]);
   assert.match(bad, /not valid JSON/);
   assert.match(unknown, /tool "delete_everything" is not available/);
+  const sent = model.requests[1].messages.find((x) => x.tool_calls).tool_calls;
+  assert.equal(sent[0].function.arguments, '{}', 'broken arguments are not sent back, or LM Studio rejects the request');
+  assert.equal(sent[1].function.arguments, '{}');
 }));
 
 test('Auto effort starts without thinking and turns it on after a failed self-check', () => withApp({ settings: { effort: 'auto' } }, [

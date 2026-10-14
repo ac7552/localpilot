@@ -975,7 +975,12 @@ function toApiMessages(messages) {
     if (m.role === 'user') out.push({ role: 'user', content: m.content });
     else if (m.role === 'assistant') {
       const msg = { role: 'assistant', content: m.content || '' };
-      if (m.tool_calls?.length) msg.tool_calls = m.tool_calls;
+      // LM Studio rejects the whole request if any earlier call's arguments aren't valid JSON, so
+      // send broken ones as {}; the tool result already told the model they were invalid.
+      if (m.tool_calls?.length) {
+        msg.tool_calls = m.tool_calls.map((tc) => (safeArgs(tc)
+          ? tc : { ...tc, function: { ...tc.function, arguments: '{}' } }));
+      }
       out.push(msg);
     } else if (m.role === 'tool') out.push({ role: 'tool', tool_call_id: m.tool_call_id, content: m.content });
   }
@@ -1970,7 +1975,7 @@ function showImproved(original, better) {
 async function executeTool(tc, view, runId) {
   const name = tc.function.name;
   const args = safeArgs(tc);
-  if (!args) return `Error: the arguments for ${name} were not valid JSON. Try again with valid JSON.`;
+  if (!args) return `Error: the arguments for ${name} were not valid JSON. Try again with valid JSON. For a long command or one full of quotes, write it to a script with write_file and run that instead.`;
   if (!activeTools().some((t) => t.name === name) || (state.settings.mode === 'chat')) return `Error: tool "${name}" is not available right now.`;
   if (name === 'ask_user') return askUser(args, view);
 
