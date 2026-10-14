@@ -25,23 +25,12 @@ const AUTO_COMPACT_AT = 0.8;
 const IMAGE_TOKENS = 768;   // rough cost of one attached image in context
 const MAX_IMAGE_SIDE = 1280;
 
-// Which tool calls need a click from the user, per mode. fetch_url is handled separately.
+// Which tool calls need a click from the user, per mode. Auto mode never asks. In Manual mode,
+// fetch_url is handled separately.
 const NEEDS_APPROVAL = {
   manual: new Set(['write_file', 'edit_file', 'run_command', 'open_file']),
   auto: new Set(),
 };
-// Commands Auto mode still asks about: they delete, escalate, publish, upload, or touch dotfiles
-// and the system. A heuristic backstop for a model that a web page may have steered, not a sandbox.
-const RISKY_COMMAND = new RegExp([
-  String.raw`\b(sudo|su|doas|rm|rmdir|dd|mkfs|diskutil|shutdown|reboot|launchctl|crontab|chown|killall|pkill|osascript|security|eval)\b`,
-  String.raw`\bkill\s`, String.raw`\bchmod\s+-R`, String.raw`\bdefaults\s+(write|delete)`,
-  String.raw`\bgit\s+(push|reset\s+--hard|clean|checkout\s+--|branch\s+-D|filter-)`,
-  String.raw`\b(npm|yarn|pnpm|gem|cargo|twine)\s+publish`,
-  String.raw`\b(curl|wget)\b.*(\|\s*(ba|z)?sh\b|\s(-d|--data\S*|-F|--form|-T|--upload-file)\b)`,
-  String.raw`\b(ssh|scp|rsync|nc|ncat|ftp)\b`,
-  String.raw`(^|[\s'"=])~?\/(etc|usr|System|Library|private|bin|sbin)\b`, String.raw`~\/\.`, String.raw`>\s*\/(?!dev\/null)`,
-].join('|'));
-
 // Each model family's recommended sampling settings (from the model authors).
 function samplingFor(modelKey, thinking) {
   const arch = modelInfo(modelKey)?.architecture || '';
@@ -941,7 +930,7 @@ function systemPrompt(memory = {}) {
       'When finished, reply with a short summary of what you made and how to use it.',
       mode === 'manual'
         ? 'The user approves every file change and command by hand.'
-        : 'File changes and commands run automatically. Commands that delete, use sudo, push, publish, upload or touch system files still need the user\'s approval.',
+        : 'File changes, commands and web fetches run automatically, without the user\'s approval.',
     );
     if (state.settings.selfCheck !== false) {
       lines.push('After each file change the app automatically checks it (syntax check, or loading HTML pages and catching JavaScript errors) and appends the result. If a check fails, fix it.');
@@ -1995,10 +1984,9 @@ async function executeTool(tc, view, runId) {
   view.tools.append(card);
   scrollToBottom(true);
 
-  // fetch_url can leak data through the URL, so only pre-approved URLs skip the prompt.
-  const untrustedFetch = name === 'fetch_url' && !state.chat.trustedUrls.includes(args.url);
-  const riskyCommand = name === 'run_command' && RISKY_COMMAND.test(String(args.command ?? ''));
-  const needsApproval = untrustedFetch || riskyCommand || NEEDS_APPROVAL[state.settings.mode]?.has(name);
+  // In Manual mode fetch_url can leak data through the URL, so only URLs from the user or a search skip the prompt.
+  const untrustedFetch = state.settings.mode === 'manual' && name === 'fetch_url' && !state.chat.trustedUrls.includes(args.url);
+  const needsApproval = untrustedFetch || NEEDS_APPROVAL[state.settings.mode]?.has(name);
   if (name === 'run_command' && args.reason) card.append(el('div', { class: 'tool-reason', text: String(args.reason) }));
   if (needsApproval) {
     const preview = await approvalPreview(name, args);

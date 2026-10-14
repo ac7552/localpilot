@@ -25,8 +25,7 @@ npm test           # agent loop, file tools and streaming, against a scripted mo
 2. **Pick a model** at the top. **Manage** loads, unloads and downloads models and sets the context size.
 3. **Set effort and mode.** *Effort* is how hard it thinks (Low, Medium, High, or Auto, which turns thinking on when
    it struggles). *Mode* is how much it may do on its own: Chat (no tools), Manual (approve everything) or Auto
-   (edits files and runs commands itself; still asks before
-   ones that delete, use sudo, push, publish or upload).
+   (edits files, runs commands and reads web pages itself, never asking).
 4. **Check the estimate** under the message box: tokens to read, answer size, time and context share. Tips flag
    problems, and **Improve prompt** rewrites a vague request.
 
