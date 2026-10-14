@@ -19,6 +19,11 @@ const ESCALATE_AFTER_STEPS = 6;
 // unless the model is stuck repeating the same tool call.
 const AUTO_MODE_MAX_STEPS = 100;
 const SAME_CALL_LIMIT = 3;
+// Stop if this many steps in a row make no progress — every tool call erroring, exiting
+// non-zero or returning empty output. Catches a model flailing with reworded retries, which
+// SAME_CALL_LIMIT (exact repeats only) misses and which `exit code: N` results slip past the
+// `Error`-prefix check entirely.
+const NO_PROGRESS_LIMIT = 5;
 
 const ENGINE_LABEL = { lmstudio: 'LM Studio', llamacpp: 'LocalPilot engine' };
 const AUTO_COMPACT_AT = 0.8;
@@ -1199,6 +1204,17 @@ function renderAttachments() {
   scheduleEstimate();
 }
 
+// A tool result that moved nothing forward: an error/denial, a non-zero exit, or a command
+// that exited 0 with no output. run_command returns "exit code: N\n<output>", so a plain
+// `/^Error/` check never sees these — hence the separate exit-code parsing here.
+function unproductiveResult(result) {
+  const r = String(result ?? '');
+  if (/^Error|^The user denied|^Stopped/.test(r)) return true;
+  const m = /^exit code: (-?\d+)\n([\s\S]*)$/.exec(r);
+  if (m) return m[1] !== '0' || m[2].trim() === '';
+  return false;
+}
+
 // ---------- the agent loop ----------
 
 async function send() {
@@ -1266,6 +1282,7 @@ async function runAgent() {
     let finalMsg = null;
     let finalView = null;
     let stepLimit = effort.maxSteps;
+    let unproductiveSteps = 0;  // consecutive steps whose every tool call made no progress
     const recentCalls = [];  // each step's tool calls, to spot a model stuck in a loop
 
     for (let step = 0; step < stepLimit; step++) {
@@ -1313,16 +1330,26 @@ async function runAgent() {
       }
 
       let checkFailed = false;
+      let stepProductive = false;
       for (const tc of res.toolCalls) {
         if (!tc.id) tc.id = 'call_' + uid();
         const result = state.stopRequested ? 'Stopped by the user.' : await executeTool(tc, view, runId);
         state.chat.messages.push({ role: 'tool', tool_call_id: tc.id, name: tc.function.name, content: result });
         if (/^Error/.test(result)) toolErrors++;
+        if (!unproductiveResult(result)) stepProductive = true;
         if (ACTION_TOOLS.has(tc.function.name) && !/^Error|^The user denied|^Stopped/.test(result)) actionsRun++;
         if (/Automatic check: (Syntax check failed|Page errors|Invalid JSON)/.test(result)) checkFailed = true;
         if (['web_search', 'fetch_url'].includes(tc.function.name) && !/^Error|^The user denied/.test(result)) usedWeb = true;
       }
       await saveChat();
+
+      // A model with no traction — every call erroring or returning nothing — otherwise burns
+      // steps (and generation time) until AUTO_MODE_MAX_STEPS. Bail and hand it back to the user.
+      unproductiveSteps = stepProductive ? 0 : unproductiveSteps + 1;
+      if (unproductiveSteps >= NO_PROGRESS_LIMIT && !state.stopRequested) {
+        notice(`Stopped: ${NO_PROGRESS_LIMIT} steps in a row returned errors or no output — the model seems stuck. Say "continue" with a hint, or check the environment (network, paths, permissions).`);
+        break;
+      }
       recentCalls.push(JSON.stringify(res.toolCalls.map((tc) => [tc.function.name, tc.function.arguments])));
       const looping = recentCalls.length >= SAME_CALL_LIMIT
         && recentCalls.slice(-SAME_CALL_LIMIT).every((c) => c === recentCalls.at(-1));

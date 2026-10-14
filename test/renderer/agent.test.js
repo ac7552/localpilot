@@ -101,6 +101,16 @@ test('Auto mode stops a model stuck repeating the same tool call', () => withApp
   assert(app.notices().some((n) => /same tool call 3 times in a row/.test(n)));
 }));
 
+test('Auto mode stops a model making no progress, even with reworded retries', () => withApp({}, (_body, n) => (
+  // A different failing command each step: not an exact repeat (so SAME_CALL_LIMIT misses it),
+  // but every one exits non-zero, so the no-progress breaker should stop it.
+  { tools: [call('run_command', { command: `echo attempt ${n} >&2; exit 1`, reason: `Retry ${n}.` })] }
+), async (app, model) => {
+  await app.start('Keep failing');
+  assert.equal(model.requests.length, 5, 'stops after 5 unproductive steps, not at AUTO_MODE_MAX_STEPS');
+  assert(app.notices().some((n) => /steps in a row returned errors or no output/.test(n)));
+}));
+
 test('Manual mode still stops at the step limit', () => withApp({ settings: { effort: 'low', mode: 'manual' } }, (_body, n) => (
   { tools: [call('search_files', { pattern: `term${n}` })] }
 ), async (app, model) => {
