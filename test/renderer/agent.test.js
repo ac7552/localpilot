@@ -58,6 +58,32 @@ test('Auto mode still asks before a risky command; denied, it doesn\'t run and t
   assert.match(toolResults(model.requests[1])[0], /The user denied this run_command\. Reason: use Python instead/);
 }));
 
+test('Auto mode keeps going past the effort\'s step limit by itself', () => withApp({ settings: { effort: 'low' } }, [
+  ...Array.from({ length: 10 }, (_, i) => ({ tools: [call('run_command', { command: `echo step ${i}`, reason: 'Count.' })] })),
+  { content: 'All ten steps done.' },
+], async (app, model) => {
+  await app.start('Do ten steps');
+  assert.equal(model.requests.length, 11, 'it ran past Low effort\'s 8 steps without waiting');
+  assert(app.notices().some((n) => /Auto mode is continuing on its own/.test(n)));
+  assert.equal(app.text(app.lastAnswer().querySelector('.content')), 'All ten steps done.');
+}));
+
+test('Auto mode stops a model stuck repeating the same tool call', () => withApp({}, () => (
+  { tools: [call('run_command', { command: 'echo same', reason: 'Again.' })] }
+), async (app, model) => {
+  await app.start('Loop forever');
+  assert.equal(model.requests.length, 3, 'stops after the third identical call');
+  assert(app.notices().some((n) => /same tool call 3 times in a row/.test(n)));
+}));
+
+test('Manual mode still stops at the step limit', () => withApp({ settings: { effort: 'low', mode: 'manual' } }, (_body, n) => (
+  { tools: [call('search_files', { pattern: `term${n}` })] }
+), async (app, model) => {
+  await app.start('Search a lot');
+  assert.equal(model.requests.length, 8);
+  assert(app.notices().some((n) => /Reached the 8-step limit for low effort/.test(n)));
+}));
+
 test('Manual mode asks before writing a file and shows what it will write', () => withApp({ settings: { mode: 'manual' } }, [
   { tools: [call('write_file', { path: 'notes.txt', content: 'line one\nline two' })] },
   { content: 'OK, left it alone.' },

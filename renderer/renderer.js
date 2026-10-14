@@ -15,6 +15,10 @@ const EFFORT = {
   auto: { reasoning: 'none', maxTokens: 4096, maxSteps: 20, hint: '', escalateTo: 'medium' },
 };
 const ESCALATE_AFTER_STEPS = 6;
+// Auto mode keeps going past the effort's step limit, up to this many steps in all,
+// unless the model is stuck repeating the same tool call.
+const AUTO_MODE_MAX_STEPS = 100;
+const SAME_CALL_LIMIT = 3;
 
 const ENGINE_LABEL = { lmstudio: 'LM Studio', llamacpp: 'LocalPilot engine' };
 const AUTO_COMPACT_AT = 0.8;
@@ -1267,8 +1271,10 @@ async function runAgent() {
     let usedWeb = false;
     let finalMsg = null;
     let finalView = null;
+    let stepLimit = effort.maxSteps;
+    const recentCalls = [];  // each step's tool calls, to spot a model stuck in a loop
 
-    for (let step = 0; step < effort.maxSteps; step++) {
+    for (let step = 0; step < stepLimit; step++) {
       if (state.stopRequested) break;
       const effortKey = escalated ? effort.escalateTo : state.settings.effort;
       const maxTokens = Math.min(EFFORT[effortKey].maxTokens, Math.floor((state.contextMax || 8192) / 2));
@@ -1323,6 +1329,13 @@ async function runAgent() {
         if (['web_search', 'fetch_url'].includes(tc.function.name) && !/^Error|^The user denied/.test(result)) usedWeb = true;
       }
       await saveChat();
+      recentCalls.push(JSON.stringify(res.toolCalls.map((tc) => [tc.function.name, tc.function.arguments])));
+      const looping = recentCalls.length >= SAME_CALL_LIMIT
+        && recentCalls.slice(-SAME_CALL_LIMIT).every((c) => c === recentCalls.at(-1));
+      if (looping) {
+        notice(`Stopped: the model made the same tool call ${SAME_CALL_LIMIT} times in a row. Say "continue" with a hint to try a different approach.`);
+        break;
+      }
 
       if (effort.escalateTo && !escalated) {
         const reason = checkFailed ? 'a self-check failed'
@@ -1334,8 +1347,15 @@ async function runAgent() {
         }
       }
 
-      if (step === effort.maxSteps - 1) {
-        notice(`Reached the ${effort.maxSteps}-step limit for ${state.settings.effort} effort. Say "continue" to keep going, or raise the effort.`);
+      if (step === stepLimit - 1) {
+        if (state.settings.mode === 'auto' && stepLimit < AUTO_MODE_MAX_STEPS) {
+          stepLimit = Math.min(stepLimit + effort.maxSteps, AUTO_MODE_MAX_STEPS);
+          notice(`${step + 1} steps so far — Auto mode is continuing on its own (up to ${stepLimit}).`);
+        } else if (state.settings.mode === 'auto') {
+          notice(`Stopped after ${AUTO_MODE_MAX_STEPS} steps, Auto mode's limit for one message. Say "continue" to keep going.`);
+        } else {
+          notice(`Reached the ${effort.maxSteps}-step limit for ${state.settings.effort} effort. Say "continue" to keep going, or raise the effort.`);
+        }
       }
     }
     run.completed = !!finalMsg && !state.stopRequested;
