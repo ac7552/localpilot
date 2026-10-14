@@ -24,8 +24,19 @@ const MAX_IMAGE_SIDE = 1280;
 // Which tool calls need a click from the user, per mode. fetch_url is handled separately.
 const NEEDS_APPROVAL = {
   manual: new Set(['write_file', 'edit_file', 'run_command', 'open_file']),
-  auto: new Set(['run_command']),
+  auto: new Set(),
 };
+// Commands Auto mode still asks about: they delete, escalate, publish, upload, or touch dotfiles
+// and the system. A heuristic backstop for a model that a web page may have steered, not a sandbox.
+const RISKY_COMMAND = new RegExp([
+  String.raw`\b(sudo|su|doas|rm|rmdir|dd|mkfs|diskutil|shutdown|reboot|launchctl|crontab|chown|killall|pkill|osascript|security|eval)\b`,
+  String.raw`\bkill\s`, String.raw`\bchmod\s+-R`, String.raw`\bdefaults\s+(write|delete)`,
+  String.raw`\bgit\s+(push|reset\s+--hard|clean|checkout\s+--|branch\s+-D|filter-)`,
+  String.raw`\b(npm|yarn|pnpm|gem|cargo|twine)\s+publish`,
+  String.raw`\b(curl|wget)\b.*(\|\s*(ba|z)?sh\b|\s(-d|--data\S*|-F|--form|-T|--upload-file)\b)`,
+  String.raw`\b(ssh|scp|rsync|nc|ncat|ftp)\b`,
+  String.raw`(^|[\s'"=])~?\/(etc|usr|System|Library|private|bin|sbin)\b`, String.raw`~\/\.`, String.raw`>\s*\/(?!dev\/null)`,
+].join('|'));
 
 // Each model family's recommended sampling settings (from the model authors).
 function samplingFor(modelKey, thinking) {
@@ -120,7 +131,7 @@ const BASE_TOOLS = [
   },
   {
     name: 'run_command',
-    description: 'Run a shell command (zsh) in the workspace folder and get its output. Use it to run the scripts you write, tests, package installs and checks yourself instead of asking the user to. The user sees your reason and approves before it runs. Commands are stopped after the timeout; do not start servers that run forever.',
+    description: 'Run a shell command (zsh) in the workspace folder and get its output. Use it to run the scripts you write, tests, package installs and checks yourself instead of asking the user to. The user sees your reason; in Manual mode, and for risky commands, they approve before it runs. Commands are stopped after the timeout; do not start servers that run forever.',
     parameters: {
       type: 'object',
       properties: {
@@ -920,13 +931,13 @@ function systemPrompt(memory = {}) {
       'Put each new project in its own subfolder unless the user says otherwise.',
       'Each project folder can have a short LOCALPILOT.md notes file (goal, stack, how to run, key decisions). Create one for new projects and keep it current when something important changes.',
       'If the request is ambiguous or you are not sure what the user wants, call ask_user with a clear question and 2-4 options instead of guessing.',
-      'Run what you write: after creating or changing a script, run it (or its tests) with run_command and fix any errors, instead of asking the user to run it. Give a short reason with each command; the user reads it when approving.',
+      'Run what you write: after creating or changing a script, run it (or its tests) with run_command and fix any errors, instead of asking the user to run it. Give a short reason with each command; the user reads it.',
       'Only ask the user to run something themselves when it needs them: a password or sudo, typing input while it runs, a GUI, or a server that keeps running.',
       'Never run destructive commands (rm -rf, sudo, disk or system changes) unless the user explicitly asked for exactly that.',
       'When finished, reply with a short summary of what you made and how to use it.',
       mode === 'manual'
         ? 'The user approves every file change and command by hand.'
-        : 'File changes happen automatically; the user approves each command after reading your reason.',
+        : 'File changes and commands run automatically. Commands that delete, use sudo, push, publish, upload or touch system files still need the user\'s approval.',
     );
     if (state.settings.selfCheck !== false) {
       lines.push('After each file change the app automatically checks it (syntax check, or loading HTML pages and catching JavaScript errors) and appends the result. If a check fails, fix it.');
@@ -1966,9 +1977,10 @@ async function executeTool(tc, view, runId) {
 
   // fetch_url can leak data through the URL, so only pre-approved URLs skip the prompt.
   const untrustedFetch = name === 'fetch_url' && !state.chat.trustedUrls.includes(args.url);
-  const needsApproval = untrustedFetch || NEEDS_APPROVAL[state.settings.mode]?.has(name);
+  const riskyCommand = name === 'run_command' && RISKY_COMMAND.test(String(args.command ?? ''));
+  const needsApproval = untrustedFetch || riskyCommand || NEEDS_APPROVAL[state.settings.mode]?.has(name);
+  if (name === 'run_command' && args.reason) card.append(el('div', { class: 'tool-reason', text: String(args.reason) }));
   if (needsApproval) {
-    if (name === 'run_command' && args.reason) card.append(el('div', { class: 'tool-reason', text: String(args.reason) }));
     const preview = await approvalPreview(name, args);
     if (preview) card.append(el('div', { class: 'tool-body' }, el('pre', { text: preview })));
     const decision = await waitForApproval(card, name);

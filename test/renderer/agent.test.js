@@ -22,18 +22,14 @@ async function withApp(opts, replies, fn) {
   }
 }
 
-test('Auto mode: writes a file, asks before running a command, then answers', () => withApp({}, [
+test('Auto mode: writes a file, runs a command without asking, then answers', () => withApp({}, [
   { reasoning: 'Write the script first.', tools: [call('write_file', { path: 'hello/hello.py', content: 'print("hi from hello")\n' })] },
   { tools: [call('run_command', { command: 'python3 hello/hello.py', reason: 'Check the script prints its greeting.' })] },
   { content: 'Done! Run it with `python3 hello/hello.py`.' },
 ], async (app, model) => {
-  const sending = app.start('Make a hello script and run it');
-  await app.waitFor(() => app.buttons('Run')[0], 'the approval card');
-  assert.equal(app.text(app.window.document.querySelector('.tool.pending .tool-reason')), 'Check the script prints its greeting.', 'the reason is shown');
-  await app.click('Run');
-  assert.equal(model.requests.length, 2, 'the command waits for approval');
-  assert.match(app.$('banner').textContent, /Waiting for your approval/);
-  await sending;
+  await app.start('Make a hello script and run it');
+  assert.equal(app.buttons('Run').length, 0, 'no approval card for a safe command');
+  assert.equal(app.text(app.window.document.querySelector('.tool .tool-reason')), 'Check the script prints its greeting.', 'the reason is shown');
 
   assert.equal(fs.readFileSync(path.join(app.workspace, 'hello/hello.py'), 'utf8'), 'print("hi from hello")\n');
   assert.match(toolResults(model.requests[1])[0], /Wrote 23 bytes to hello\/hello.py\nAutomatic check: Syntax check passed\./);
@@ -49,8 +45,8 @@ test('Auto mode: writes a file, asks before running a command, then answers', ()
   await app.waitFor(() => !fs.existsSync(path.join(app.workspace, 'hello/hello.py')), 'undo to remove the file');
 }));
 
-test('a denied command doesn\'t run, and the model hears why', () => withApp({}, [
-  { tools: [call('run_command', { command: 'touch ran.txt' })] },
+test('Auto mode still asks before a risky command; denied, it doesn\'t run and the model hears why', () => withApp({}, [
+  { tools: [call('run_command', { command: 'touch ran.txt && rm -f nothing.txt' })] },
   { content: 'Understood, I won\'t run it.' },
 ], async (app, model) => {
   const sending = app.start('Touch a file');
