@@ -273,7 +273,7 @@ function servableModels() {
   const details = (key) => downloadedCache.find((m) => m.modelKey === key) ?? {};
   const out = [];
   if (engine?.ready && !engine.pooled) {
-    out.push({ key: engine.modelKey, name: engine.displayName, ctx: engine.contextLength, vision: engine.vision, arch: engine.architecture });
+    out.push({ key: engine.modelKey, name: engine.displayName, ctx: engine.contextLength, vision: engine.projector, arch: engine.architecture });
   }
   for (const m of lmsLoaded) {
     if (out.some((x) => x.key === m.modelKey)) continue;
@@ -331,7 +331,8 @@ const rpcEngineAvailable = () => fs.existsSync(path.join(LLAMA_RPC_BIN, 'llama-s
 
 // pool: { rpc: ['127.0.0.1:port', …], split: [MiB here, MiB on each machine…], peers: [names] }
 // to split the model across machines (network/manager.js tunnels each address to one of them).
-function startEngine(model, contextLength, pool = null) {
+// vision: also load the image projector (~1 GB of GPU memory), so it's only loaded for chats with images.
+function startEngine(model, contextLength, pool = null, { vision = false } = {}) {
   return new Promise((resolve) => {
     const args = [
       '-m', path.join(LMS_MODELS, model.path),
@@ -356,19 +357,24 @@ function startEngine(model, contextLength, pool = null) {
       args.push('-dev', ['MTL0', ...pool.rpc.map((_, i) => `RPC${i}`)].join(','));
       args.push('-ts', pool.split.map((n) => Math.max(1, Math.round(n))).join(','));
     }
-    // Keep at most 2 GiB of recent prompt states in RAM (the 8 GiB default is half this Mac),
-    // and let each chat's cache be saved to disk. Slot files don't cover a draft model's state,
+    // Keep at most 512 MiB of recent prompt states in RAM (the 8 GiB default is half this Mac,
+    // and 2 GiB measurably slowed generation under memory pressure); each chat's cache is saved to disk. Slot files don't cover a draft model's state,
     // and aren't used for pooled models, whose state lives partly on other machines.
-    args.push('--cache-ram', '2048');
+    args.push('--cache-ram', '512');
     if (!hasDraft && !pool) {
       fs.mkdirSync(kvDir(), { recursive: true });
       args.push('--slot-save-path', kvDir());
     }
     // Vision: load the projector file that sits next to the model, if there is one.
-    try {
+    // Pooled models keep it loaded, since they aren't reloaded per chat.
+    let projector = false;
+    if (vision || pool) try {
       const dir = path.dirname(path.join(LMS_MODELS, model.path));
       const mmproj = fs.readdirSync(dir).find((f) => /^mmproj.*\.gguf$/i.test(f) || /\.mmproj-.*\.gguf$/i.test(f));
-      if (mmproj && model.vision) args.push('--mmproj', path.join(dir, mmproj));
+      if (mmproj && model.vision) {
+        args.push('--mmproj', path.join(dir, mmproj));
+        projector = true;
+      }
     } catch { /* no projector */ }
     const child = spawn(pool ? path.join(LLAMA_RPC_BIN, 'llama-server') : LLAMA_SERVER, args, { env: process.env });
     let log = '';
@@ -402,7 +408,7 @@ function startEngine(model, contextLength, pool = null) {
       child, modelKey: model.modelKey, displayName: model.displayName, contextLength, ready: false,
       slotSave: !hasDraft && !pool, slotOwner: null,  // slotOwner: the chat whose prompt is in the cache now
       pooled: pool ? pool.peers : null,
-      architecture: model.architecture, vision: !!model.vision,
+      architecture: model.architecture, vision: !!model.vision, projector,
     };
     setTimeout(() => {
       if (!settled) {
@@ -422,7 +428,7 @@ ipcMain.handle('models:list', async () => {
   const loaded = parseJson(ps.out, []).filter((m) => m.type === 'llm').map((m) => ({ ...m, engine: 'lmstudio' }));
   lmsLoaded = loaded;
   if (engine?.ready) {
-    loaded.push({ modelKey: engine.modelKey, displayName: engine.displayName, contextLength: engine.contextLength, engine: 'llamacpp', pooled: engine.pooled });
+    loaded.push({ modelKey: engine.modelKey, displayName: engine.displayName, contextLength: engine.contextLength, engine: 'llamacpp', pooled: engine.pooled, projector: engine.projector });
   }
   return { downloaded, loaded, remote: network?.remoteModels() ?? [], engineAvailable: engineAvailable(), rpcAvailable: rpcEngineAvailable() };
 });
@@ -449,7 +455,7 @@ async function startPooledModel({ modelKey, contextLength, rpc, split, peers }) 
   return startEngine(model, contextLength, { rpc, split, peers });
 }
 
-ipcMain.handle('models:load', async (_e, { modelKey, contextLength }) => {
+ipcMain.handle('models:load', async (_e, { modelKey, contextLength, vision }) => {
   // Only one model fits in GPU memory at a time, whichever engine runs it.
   if (engine?.slotOwner) await saveSlot(engine.slotOwner);
   await stopEngine();
@@ -457,7 +463,7 @@ ipcMain.handle('models:load', async (_e, { modelKey, contextLength }) => {
   await runLms(['unload', '--all'], { timeoutMs: 60_000 });
 
   const model = (await listDownloaded()).find((m) => m.modelKey === modelKey);
-  if (model && engineFor(model) === 'llamacpp') return startEngine(model, contextLength);
+  if (model && engineFor(model) === 'llamacpp') return startEngine(model, contextLength, null, { vision });
 
   const r = await runLms(['load', modelKey, '--gpu', 'max', '-c', String(contextLength), '--parallel', '1', '-y'], {
     timeoutMs: 300_000,

@@ -426,7 +426,7 @@ function explainLoadError(error) {
   return error || 'unknown error';
 }
 
-async function loadModel(modelKey, contextLength = state.settings.contextLength) {
+async function loadModel(modelKey, contextLength = state.settings.contextLength, { vision = false } = {}) {
   await stopUpkeep();
   // Loading unloads everything first, so remember what was working to restore it on failure.
   const previous = state.models.loaded[0];
@@ -437,7 +437,7 @@ async function loadModel(modelKey, contextLength = state.settings.contextLength)
     state.loadingModel = `loading ${percent}%`;
     renderModelStatus();
   });
-  const res = await api.loadModel({ modelKey, contextLength: Number(contextLength) });
+  const res = await api.loadModel({ modelKey, contextLength: Number(contextLength), vision });
   off();
   state.loadErrors[modelKey] = res.ok ? null : explainLoadError(res.error);
 
@@ -465,13 +465,20 @@ async function ensureModelReady() {
     return false;
   }
   await api.ensureServer();
-  if (loadedInfo(state.settings.model)) return true;
+  // The built-in engine loads image support only when a chat has images (it costs ~1 GB).
+  const vision = state.chat.messages.some((m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url'));
+  const info = loadedInfo(state.settings.model);
+  if (info) {
+    if (!vision || info.engine !== 'llamacpp' || info.pooled || info.projector) return true;
+    notice(`Loading image support for ${state.settings.model}…`);
+    return loadModel(state.settings.model, info.contextLength, { vision });
+  }
   if (!state.settings.model) {
     notice('No model selected. Click Manage to download one.', 'error');
     return false;
   }
   notice(`Loading ${state.settings.model}…`);
-  return loadModel(state.settings.model);
+  return loadModel(state.settings.model, undefined, { vision });
 }
 
 function renderModelRows() {
