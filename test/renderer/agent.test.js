@@ -122,6 +122,39 @@ test('a context-overflow 400 is trimmed and retried, not surfaced as an error', 
   assert(!app.notices().some((n) => /returned 400/.test(n)), 'the raw 400 was not shown to the user');
 }));
 
+test('a run interrupted by a crash resumes on the next launch', () => withApp({}, [
+  { content: 'Picked it back up and finished.' },
+], async (app, model) => {
+  // A chat left mid-run: running flag set, ending on a tool result with no final answer.
+  const crashed = {
+    id: 'crashed1', title: 'Crashed task', updatedAt: Date.now(), running: true,
+    messages: [
+      { role: 'user', content: 'do a thing' },
+      { role: 'assistant', tool_calls: [{ id: 't1', type: 'function', function: { name: 'run_command', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 't1', name: 'run_command', content: 'exit code: 0\nok' },
+    ],
+  };
+  await app.ev(`api.saveChat(${JSON.stringify(crashed)})`);
+  await app.ev('resumeOrNew()');
+  await app.waitFor(() => !app.ev('state.busy'), 'the resumed run to finish');
+  assert.equal(app.ev('state.chat.id'), 'crashed1', 'it reopened the interrupted chat');
+  assert.equal(app.text(app.lastAnswer().querySelector('.content')), 'Picked it back up and finished.');
+  assert(app.notices().some((n) => /left off/.test(n)), app.notices().join('\n'));
+  assert.equal(app.ev('state.chat.running'), false, 'the run flag is cleared once it finishes');
+}));
+
+test('a tool call with no result is healed before resuming', () => withApp({}, [{ content: 'x' }], async (app) => {
+  const roles = app.ev(`(() => {
+    const c = { messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', tool_calls: [{ id: 'a', function: { name: 'run_command' } }] },
+    ] };
+    healInterruptedToolCalls(c);
+    return c.messages.map((m) => m.role + (m.content ? '' : ''));
+  })()`);
+  assert.deepEqual(roles, ['user', 'assistant', 'tool'], 'a placeholder tool result was inserted');
+}));
+
 test('Manual mode still stops at the step limit', () => withApp({ settings: { effort: 'low', mode: 'manual' } }, (_body, n) => (
   { tools: [call('search_files', { pattern: `term${n}` })] }
 ), async (app, model) => {

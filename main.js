@@ -27,6 +27,11 @@ let engine = null;  // { child, modelKey, displayName, contextLength, ready, poo
 let network = null; // Connect: other machines (network/manager.js)
 const MAX_TOOL_OUTPUT = 12000;
 const MAX_READ_BYTES = 200_000;
+// Give up on a stream when the engine goes quiet: a long window for the first token (prompt
+// prefill can be slow on a big context), then a shorter gap between tokens once it's flowing.
+// Without this, a wedged engine hangs the UI forever on "preparing …".
+const STREAM_FIRST_TOKEN_MS = 300_000;
+const STREAM_STALL_MS = 90_000;
 
 let win;
 const streams = new Map();   // requestId -> AbortController
@@ -203,7 +208,7 @@ ipcMain.handle('chats:list', async () => {
   for (const f of files) {
     try {
       const c = JSON.parse(await fsp.readFile(path.join(chatsDir(), f), 'utf8'));
-      chats.push({ id: c.id, title: c.title, updatedAt: c.updatedAt });
+      chats.push({ id: c.id, title: c.title, updatedAt: c.updatedAt, running: !!c.running });
     } catch { /* skip unreadable chat files */ }
   }
   return chats.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -536,12 +541,24 @@ async function streamCompletion({ body, slotOwner = null, signal, onChunk }) {
     delete payload.reasoning_effort;
     payload.chat_template_kwargs = { ...(payload.chat_template_kwargs || {}), enable_thinking: false };
   }
+  // Watchdog: abort if the engine stops sending data. Chained to the caller's own abort signal.
+  const ac = new AbortController();
+  const onExternalAbort = () => ac.abort();
+  if (signal) { if (signal.aborted) ac.abort(); else signal.addEventListener('abort', onExternalAbort); }
+  let stalled = false;
+  let gotChunk = false;
+  let watchdog = null;
+  const arm = () => {
+    clearTimeout(watchdog);
+    watchdog = setTimeout(() => { stalled = true; ac.abort(); }, gotChunk ? STREAM_STALL_MS : STREAM_FIRST_TOKEN_MS);
+  };
   try {
+    arm();
     const res = await fetch(`${base}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      signal,
+      signal: ac.signal,
     });
     if (!res.ok) {
       const text = await res.text();
@@ -551,6 +568,8 @@ async function streamCompletion({ body, slotOwner = null, signal, onChunk }) {
     let buffer = '';
     let streamError = null;
     for await (const chunk of res.body) {
+      gotChunk = true;
+      arm();
       buffer += decoder.decode(chunk, { stream: true });
       let nl;
       while ((nl = buffer.indexOf('\n')) >= 0) {
@@ -584,8 +603,12 @@ async function streamCompletion({ body, slotOwner = null, signal, onChunk }) {
     }
     return { ok: true };
   } catch (err) {
+    if (stalled) return { ok: false, error: `The model stopped responding (no output for ${Math.round(STREAM_STALL_MS / 1000)}s). The engine may be wedged — pick the model again from the dropdown to reload it.` };
     if (err.name === 'AbortError') return { ok: true, aborted: true };
     return { ok: false, error: `Could not reach ${onEngine ? 'the LocalPilot engine' : 'LM Studio'} at ${base}: ${err.message}` };
+  } finally {
+    clearTimeout(watchdog);
+    if (signal) signal.removeEventListener('abort', onExternalAbort);
   }
 }
 

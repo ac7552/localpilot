@@ -672,6 +672,53 @@ function startNewChat() {
   renderWorkspace();
 }
 
+// A run killed mid tool-execution leaves an assistant tool_call with no matching tool result,
+// which the engine rejects. Fill any gaps so the conversation can be continued.
+function healInterruptedToolCalls(chat) {
+  const out = [];
+  for (const m of chat.messages) {
+    out.push(m);
+    if (m.role === 'assistant' && m.tool_calls?.length) {
+      for (const tc of m.tool_calls) {
+        if (!chat.messages.some((x) => x.role === 'tool' && x.tool_call_id === tc.id)) {
+          out.push({ role: 'tool', tool_call_id: tc.id, name: tc.function?.name, content: 'Interrupted: the app closed before this tool ran.' });
+        }
+      }
+    }
+  }
+  chat.messages = out;
+}
+
+// On launch, pick up a task that was interrupted (crash or force-quit) instead of opening a blank
+// chat, and continue it on its own — no need for the user to say where it left off.
+async function resumeOrNew() {
+  try {
+    const last = (await api.listChats())[0];
+    if (last?.running) {
+      const chat = await api.loadChat(last.id);
+      const msgs = (chat?.messages ?? []).filter((m) => m.role !== 'notice');
+      const tail = msgs.at(-1);
+      // Resume only if the conversation really is unfinished (not ending in a final answer).
+      const unfinished = tail && !(tail.role === 'assistant' && tail.content && !tail.tool_calls?.length);
+      if (unfinished) {
+        state.chat = { ...newChatObject(), ...chat };
+        state.chat.usage = { cached: 0, ...state.chat.usage };
+        state.contextUsed = state.chat.lastContextUsed || 0;
+        healInterruptedToolCalls(state.chat);
+        renderConversation();
+        renderChatList();
+        renderWorkspace();
+        notice('Picking up the task where it left off when the app closed.');
+        await runAgent();
+        return;
+      }
+    }
+  } catch (err) {
+    console.warn('resume check failed:', err);
+  }
+  startNewChat();
+}
+
 async function openChat(id) {
   if (state.busy) return;
   state.chat = { ...newChatObject(), ...(await api.loadChat(id)) };
@@ -1294,6 +1341,9 @@ async function runAgent() {
     state.chat.prefixKey = prefixKeyFor(state.settings.model, systemPrompt(memory), wrapTools(tools));
     state.chat.prefixParts = prefixPartsFor(state.settings.model, memory);
     run = startRun();
+    // Mark the chat as mid-run so a reopen after a crash or force-quit can pick it up. Saved with
+    // every mid-run saveChat(); cleared in the finally on a clean finish or a user stop.
+    state.chat.running = true;
     let escalated = false;
     let toolErrors = 0;
     let actionsRun = 0;  // file/command tools that actually ran, for the grounding check
@@ -1431,6 +1481,7 @@ async function runAgent() {
         scrollToBottom();
       }
     } catch { /* nothing changed */ }
+    state.chat.running = false;  // the run ended here (finished or stopped); nothing to resume
     await saveChat();
     await saveRunStats(run).catch(() => {});
     setBusy(false);
@@ -2836,11 +2887,13 @@ async function init() {
   await refreshSkills();
   renderMemoryBadge();
 
-  startNewChat();
+  startNewChat();  // show something immediately while the server warms up
   await api.ensureServer();
   await refreshModels();
   // Keep the loaded-model status fresh (e.g. if LM Studio unloads it).
   setInterval(() => { if (!state.busy && !state.loadingModel) refreshModels(); }, 20000);
+  // Now the model is known, pick up an interrupted task if there is one.
+  if (!state.busy && !state.chat.messages.length) await resumeOrNew();
 }
 
 init();
