@@ -111,6 +111,17 @@ test('Auto mode stops a model making no progress, even with reworded retries', (
   assert(app.notices().some((n) => /steps in a row returned errors or no output/.test(n)));
 }));
 
+test('a context-overflow 400 is trimmed and retried, not surfaced as an error', () => withApp({}, [
+  { status: 400, text: 'request (35012 tokens) exceeds the available context size (32768 tokens)' },
+  { content: 'Here is the answer.' },
+], async (app, model) => {
+  await app.start('Answer me');
+  assert.equal(model.requests.length, 2, 'it retried after the overflow instead of stopping');
+  assert.equal(app.text(app.lastAnswer().querySelector('.content')), 'Here is the answer.');
+  assert(app.notices().some((n) => /overflowed the context window/.test(n)), app.notices().join('\n'));
+  assert(!app.notices().some((n) => /returned 400/.test(n)), 'the raw 400 was not shown to the user');
+}));
+
 test('Manual mode still stops at the step limit', () => withApp({ settings: { effort: 'low', mode: 'manual' } }, (_body, n) => (
   { tools: [call('search_files', { pattern: `term${n}` })] }
 ), async (app, model) => {

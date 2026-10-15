@@ -992,16 +992,35 @@ function toApiMessages(messages) {
   return out;
 }
 
-// Drop the oldest whole turns until the request fits in the context window.
-function fitToContext(maxTokens, memory) {
+// Drop the oldest whole turns until the request fits in the context window. When even the
+// current turn is too big on its own (e.g. many tool outputs in one run), shrink its largest
+// tool results rather than giving up — otherwise the request 400s with exceed_context_size_error.
+// `aggressive` leaves extra headroom when recovering from an overflow the engine already reported.
+function fitToContext(maxTokens, memory, { aggressive = false } = {}) {
   const limit = state.contextMax || 8192;
+  // estimateTokens runs under the real tokenizer; use the model's learned calibration (never below
+  // 1, so we only ever over-reserve) so the trim fires before the real prompt exceeds the window.
+  const calib = Math.max(1, promptStats().calib?.[state.settings.model] ?? 1);
+  const reserve = maxTokens + 512 + (aggressive ? Math.ceil(limit * 0.1) : 0);
+  const over = () => estimateTokens(apiMessages(memory)) * calib + reserve > limit;
   let trimmed = false;
-  while (estimateTokens(apiMessages(memory)) + maxTokens + 512 > limit) {
+  while (over()) {
     const msgs = state.chat.messages;
     const firstUser = msgs.findIndex((m) => m.role === 'user');
     const nextUser = msgs.findIndex((m, i) => i > firstUser && m.role === 'user' && !m.hidden);
-    if (firstUser < 0 || nextUser < 0) break;  // keep the current turn no matter what
+    if (firstUser < 0 || nextUser < 0) break;  // no older turn to drop; fall through to shrinking
     msgs.splice(firstUser, nextUser - firstUser);
+    trimmed = true;
+  }
+  // A single turn still over budget: progressively truncate its biggest tool outputs until it fits.
+  while (over()) {
+    const biggest = state.chat.messages
+      .filter((m) => m.role === 'tool' && String(m.content ?? '').length > 600)
+      .sort((a, b) => String(b.content).length - String(a.content).length)[0];
+    if (!biggest) break;
+    const s = String(biggest.content);
+    const keep = Math.max(300, Math.floor(s.length * 0.6));
+    biggest.content = s.slice(0, keep) + `\n…[trimmed ${s.length - keep} chars to fit the context window]`;
     trimmed = true;
   }
   if (trimmed) {
@@ -1283,6 +1302,7 @@ async function runAgent() {
     let finalView = null;
     let stepLimit = effort.maxSteps;
     let unproductiveSteps = 0;  // consecutive steps whose every tool call made no progress
+    let overflowRetries = 0;  // times we've trimmed and retried after a context-overflow 400
     const recentCalls = [];  // each step's tool calls, to spot a model stuck in a loop
 
     for (let step = 0; step < stepLimit; step++) {
@@ -1307,6 +1327,18 @@ async function runAgent() {
       const body = requestBody(apiMessages(memory), { maxTokens, tools, effortKey });
       const res = await streamOnce(body, view, { slotOwner: state.chat.id });
       if (!res.ok) {
+        // The estimate can still run under the real tokenizer and overflow the window. Rather than
+        // ending the run, trim harder (dropping older turns and shrinking big tool outputs) and
+        // retry the same step a couple of times before giving up.
+        const overflow = /exceed_context_size_error|exceeds the available context/i.test(res.error || '');
+        if (overflow && overflowRetries < 2) {
+          overflowRetries++;
+          view.root.remove();
+          if (fitToContext(maxTokens, memory, { aggressive: true })) renderConversation();
+          notice('The prompt overflowed the context window — trimmed older content and retrying.');
+          step--;
+          continue;
+        }
         view.meta.textContent = '';
         notice(res.error, 'error');
         break;
