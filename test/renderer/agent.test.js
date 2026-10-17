@@ -101,6 +101,16 @@ test('Auto mode stops a model stuck repeating the same tool call', () => withApp
   assert(app.notices().some((n) => /same tool call 3 times in a row/.test(n)));
 }));
 
+test('Auto mode stops a model cut off at the output cap mid-write every step', () => withApp({}, (_body, n) => (
+  // Each write succeeds (so it's "productive") and targets a different file (so it's not an exact
+  // repeat), but every step runs out of output budget — the truncation breaker should stop it.
+  { tools: [call('write_file', { path: `big/part${n}.txt`, content: 'x'.repeat(50) })], finish: 'length' }
+), async (app, model) => {
+  await app.start('Write an enormous file');
+  assert.equal(model.requests.length, 3, 'stops after the third truncated step');
+  assert(app.notices().some((n) => /ran out of output budget mid-write/.test(n)));
+}));
+
 test('Auto mode stops a model making no progress, even with reworded retries', () => withApp({}, (_body, n) => (
   // A different failing command each step: not an exact repeat (so SAME_CALL_LIMIT misses it),
   // but every one exits non-zero, so the no-progress breaker should stop it.

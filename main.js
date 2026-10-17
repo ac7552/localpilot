@@ -351,11 +351,23 @@ function startEngine(model, contextLength, pool = null, { vision = false } = {})
     ];
     // Qwen3.5/3.6 need a full-precision KV cache; other models fit ~2x the context with q8.
     if (!AUTO_ENGINE_ARCH.test(model.architecture || '')) args.push('-ctk', 'q8_0', '-ctv', 'q8_0');
-    // Speed: a multi-token-prediction draft model, measured ~30% faster for Gemma 4 on this Mac.
-    const MTP_DRAFTS = { gemma4: path.join(os.homedir(), 'models', 'mtp-gemma-4-12B-it.gguf') };
-    const draft = MTP_DRAFTS[model.architecture];
-    const hasDraft = !pool && !!draft && fs.existsSync(draft);
-    if (hasDraft) args.push('-md', draft, '--spec-type', 'draft-mtp');
+    // Speed: speculative decoding. The engine drafts several tokens with a small model and
+    // verifies them in one pass with the full model; Gemma 4's MTP draft measured ~30% faster
+    // on this Mac. A regular draft (mtp: false) is any small same-family model — drop a GGUF at
+    // the path below to turn it on for Qwen. A missing file changes nothing, so this is safe to
+    // ship ahead of the file. Note: a draft disables KV-cache slot saving (warm chats) for that
+    // model, since slot files don't cover the draft's state.
+    const DRAFTS = {
+      gemma4: { path: path.join(os.homedir(), 'models', 'mtp-gemma-4-12B-it.gguf'), mtp: true },
+      qwen35: { path: path.join(os.homedir(), 'models', 'qwen3.5-draft.gguf'), mtp: false },
+    };
+    const draft = DRAFTS[model.architecture];
+    const hasDraft = !pool && !!draft && fs.existsSync(draft.path);
+    if (hasDraft) {
+      args.push('-md', draft.path);
+      if (draft.mtp) args.push('--spec-type', 'draft-mtp');
+      else args.push('--draft-max', '16', '--draft-min', '1');
+    }
     // A pooled model: this Mac's GPU plus one RPC device per machine, each given its share.
     if (pool) {
       args.push('--rpc', pool.rpc.join(','));

@@ -24,6 +24,11 @@ const SAME_CALL_LIMIT = 3;
 // SAME_CALL_LIMIT (exact repeats only) misses and which `exit code: N` results slip past the
 // `Error`-prefix check entirely.
 const NO_PROGRESS_LIMIT = 5;
+// Stop if this many steps in a row hit the output-token cap mid-tool-call (finish reason
+// "length"). That means the model is trying to write a file bigger than one step's output
+// budget: it gets truncated, re-issues the write, and loops — slowly, since each step spends
+// the whole budget. The content differs each time, so SAME_CALL_LIMIT never catches it.
+const TRUNCATED_CALL_LIMIT = 3;
 
 const ENGINE_LABEL = { lmstudio: 'LM Studio', llamacpp: 'LocalPilot engine' };
 const AUTO_COMPACT_AT = 0.8;
@@ -1352,6 +1357,7 @@ async function runAgent() {
     let finalView = null;
     let stepLimit = effort.maxSteps;
     let unproductiveSteps = 0;  // consecutive steps whose every tool call made no progress
+    let truncatedSteps = 0;  // consecutive steps cut off at the output cap mid-tool-call
     let overflowRetries = 0;  // times we've trimmed and retried after a context-overflow 400
     const recentCalls = [];  // each step's tool calls, to spot a model stuck in a loop
 
@@ -1430,6 +1436,13 @@ async function runAgent() {
       unproductiveSteps = stepProductive ? 0 : unproductiveSteps + 1;
       if (unproductiveSteps >= NO_PROGRESS_LIMIT && !state.stopRequested) {
         notice(`Stopped: ${NO_PROGRESS_LIMIT} steps in a row returned errors or no output — the model seems stuck. Say "continue" with a hint, or check the environment (network, paths, permissions).`);
+        break;
+      }
+      // A tool call that hit the output cap was cut off mid-write; the model keeps re-issuing it,
+      // burning the full budget each step. Bail rather than loop at the slowest possible rate.
+      truncatedSteps = res.finishReason === 'length' ? truncatedSteps + 1 : 0;
+      if (truncatedSteps >= TRUNCATED_CALL_LIMIT && !state.stopRequested) {
+        notice(`Stopped: ${TRUNCATED_CALL_LIMIT} steps in a row ran out of output budget mid-write (the ${fmt(maxTokens)}-token cap). The file is probably too big for one step — ask for it in smaller pieces, raise the context size, or split the work.`, 'error');
         break;
       }
       recentCalls.push(JSON.stringify(res.toolCalls.map((tc) => [tc.function.name, tc.function.arguments])));
